@@ -314,7 +314,7 @@ static void MNNSumByAxisLForMatmul_A(float* dest, int8_t* source, const float* s
         dest += (step * blockNum);
         realDstCount -= step;
         srcInt8 += col_buffer_unit_size;
-    } while(realDstCount > 0); 
+    } while(realDstCount > 0);
 }
 
 template<typename T>
@@ -690,9 +690,7 @@ void MNNAccumulateSequenceNumber (float* dst, const float* src, int size) {
             src += 8;
         }
         sum4_1 = vaddq_f32(sum4_1, sum4_2);
-        for (int j = 0;j < 4; ++j) {
-            sum += sum4_1[j];
-        }
+        sum = (sum4_1[0] + sum4_1[1]) + (sum4_1[2] + sum4_1[3]);
     }
 #elif defined(MNN_USE_SSE)
     if (size >= 8) {
@@ -3202,7 +3200,7 @@ void MNNCoreFunctionInit() {
     gCoreFunction->MNNFp16ToFp8 = MNNFp16ToFp8;
     gCoreFunction->MNNFp8ToFp32 = MNNFp8ToFp32;
     gCoreFunction->MNNFp8ToFp16 = MNNFp8ToFp16;
-    
+
     // MatMul
     gCoreFunction->MNNGetMatMulPackMode = MNNGetMatMulPackMode;
     gCoreFunction->MNNPackC4ForMatMul_A = MNNPackC4ForMatMul_A;

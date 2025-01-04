@@ -40,6 +40,7 @@ namespace MNN {
 #define CL_KERNEL_WAVE_SIZE_QCOM 0xAA02
 
 enum GpuType { MALI = 0, ADRENO = 1, RADEON = 2, INTEL = 3, OTHER = 4 };
+enum GpuLevel { UNDEFINED = 0, TOP = 1, MEDIUM = 2, LOW = 3 };
 enum MaliAr { MIDGARD = 0, BIFROST = 1, VALHALL = 2 };
 enum GpuMemObject { AUTO = 0, BUFFER = 1, IMAGE = 2};
 enum CLTuneLevel { None = 0, Heavy = 1, Wide = 2, Normal = 3, Fast = 4};
@@ -91,6 +92,7 @@ public:
     uint64_t GetKernelWaveSize(std::shared_ptr<KernelWrap> kernel);
     std::vector<uint32_t> getMaxWorkItemSizes();
     uint64_t getMaxLocalMem() const;
+    void setPrecision(const BackendConfig::PrecisionMode precision);
     uint32_t getUseRecordableQueueSize(){
         return mUseRecordableQueueSize;
     }
@@ -110,9 +112,9 @@ public:
         return mCLVersion;
     }
 	uint32_t getPrecisionLevel() const;
-    bool isSupportGL(){
-    	return mIsSupportGL;
-	}
+    bool isSupportAHD(){
+        return mIsSupportAHD;
+    }
 #ifdef MNN_OPENCL_SVM_ENABLE
     cl_device_svm_capabilities getSvmCapabilities() {
         return mSvmCapabilities;
@@ -123,6 +125,9 @@ public:
     }
     CLTuneLevel getCLTuneLevel() {
         return mTuneLevel;
+    }
+    GpuLevel getGpuLevel() {
+        return mGpuLevel;
     }
     std::string getDeviceName() {
         return mDeviceName;
@@ -215,9 +220,10 @@ private:
     bool mSupportDotInt8 = false;
     bool mSupportDotAccInt8 = false;
     bool mSupportedIntelSubgroup = false;
-    bool mIsSupportGL = true;
+    bool mIsSupportAHD = false;
     GpuType mGpuType;
     MaliAr mMaliAr;
+    GpuLevel mGpuLevel = UNDEFINED;
     float mCLVersion = 1.0f;
     std::vector<std::pair<std::string, cl::Event>> mEvents;
 

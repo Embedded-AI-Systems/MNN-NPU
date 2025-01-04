@@ -20,7 +20,7 @@
 #endif // CONSTANT
 
 #ifdef MNN_KLEIDIAI_ENABLED
-#include "../backend/cpu/arm/kleidiAI/mnn_kleidiai.h"
+#include "../backend/cpu/arm/mnn_kleidiai.h"
 /**
  * Set DenseConvInt8TiledExecutor's input/output tensor format: 
  * KAI_CONV_NCHW_IN_OUT = 1: format will be NCHW, skip pack/unpack functions.
@@ -124,6 +124,8 @@ struct Tensor::InsideDescribe {
         pad mPads;
         // For isMutable = false Tensor , determine whether the content can be convert to main backend
         uint32_t stageMask = 0;
+        // Use for shared memory
+        SharedPtr<Backend::MemObj> mSharedMem;
     };
     std::shared_ptr<NativeInsideDescribe> mContent;
     SharedPtr<Backend::MemObj> mem;
@@ -224,6 +226,10 @@ public:
     static void setTensorSupportPack(const Tensor* tensor, bool flag);
 
     static void setTensorPad(const Tensor* tensor, int left, int right, int bottom, int top);
+    
+    static void setSharedMem(const Tensor* tensor, Backend::MemObj *mem);
+    
+    static Backend::MemObj* getSharedMem(const Tensor* tensor);
 };
 } // namespace MNN
 

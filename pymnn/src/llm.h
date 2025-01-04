@@ -4,6 +4,7 @@
 typedef struct {
     PyObject_HEAD
     MNN::Transformer::Llm* llm;
+    bool is_embedding = false;
 } LLM;
 
 static PyObject* PyMNNLLM_new(struct _typeobject *type, PyObject *args, PyObject *kwds) {
@@ -25,6 +26,9 @@ static PyObject* PyMNNLLM_load(LLM *self, PyObject *args) {
 }
 
 static PyObject* PyMNNLLM_forward(LLM *self, PyObject *args) {
+    if (self->is_embedding) {
+        Py_RETURN_NONE;
+    }
     PyObject *input_ids = nullptr;
     if (!PyArg_ParseTuple(args, "O", &input_ids) && isInts(input_ids)) {
         Py_RETURN_NONE;
@@ -37,6 +41,9 @@ static PyObject* PyMNNLLM_forward(LLM *self, PyObject *args) {
 }
 
 static PyObject* PyMNNLLM_generate(LLM *self, PyObject *args) {
+    if (self->is_embedding) {
+        Py_RETURN_NONE;
+    }
     PyObject *input_ids = nullptr;
     if (!PyArg_ParseTuple(args, "O", &input_ids) && isInts(input_ids)) {
         Py_RETURN_NONE;
@@ -45,18 +52,43 @@ static PyObject* PyMNNLLM_generate(LLM *self, PyObject *args) {
     return toPyObj<int, toPyObj>(output_ids);
 }
 
+static PyObject* PyMNNLLM_eraseHistory(LLM *self, PyObject *args) {
+    if (self->is_embedding) {
+        Py_RETURN_NONE;
+    }
+    size_t history = 0;
+    size_t end = 0;
+    if (!PyArg_ParseTuple(args, "LL", &history, &end)) {
+        Py_RETURN_NONE;
+    }
+    self->llm->eraseHistory(history, end);
+    Py_RETURN_NONE;
+}
+static PyObject* PyMNNLLM_getCurrentHistory(LLM *self, PyObject *args) {
+    if (self->is_embedding) {
+        Py_RETURN_NONE;
+    }
+    auto history = self->llm->getCurrentHistory();
+    return PyLong_FromLong(history);
+}
 static PyObject* PyMNNLLM_response(LLM *self, PyObject *args) {
+    if (self->is_embedding) {
+        Py_RETURN_NONE;
+    }
     const char* query = NULL;
     int stream = 0;
     if (!PyArg_ParseTuple(args, "s|p", &query, &stream)) {
         Py_RETURN_NONE;
     }
     std::ostringstream null_os;
-    auto res = self->llm->response(query, stream ? &std::cout : &null_os);
-    return string2Object(res);
+    self->llm->response(query, stream ? &std::cout : &null_os);
+    return string2Object(null_os.str());
 }
 
 static PyObject* PyMNNLLM_tokenizer_encode(LLM *self, PyObject *args) {
+    if (self->is_embedding) {
+        Py_RETURN_NONE;
+    }
     const char* prompt = NULL;
     int use_template = 0;
     if (!PyArg_ParseTuple(args, "s|p", &prompt, &use_template)) {
@@ -67,6 +99,9 @@ static PyObject* PyMNNLLM_tokenizer_encode(LLM *self, PyObject *args) {
 }
 
 static PyObject* PyMNNLLM_tokenizer_decode(LLM *self, PyObject *args) {
+    if (self->is_embedding) {
+        Py_RETURN_NONE;
+    }
     PyObject *id = nullptr;
     if (!PyArg_ParseTuple(args, "O", &id) && isInt(id)) {
         Py_RETURN_NONE;
@@ -75,13 +110,29 @@ static PyObject* PyMNNLLM_tokenizer_decode(LLM *self, PyObject *args) {
     return string2Object(query);
 }
 
+static PyObject* PyMNNLLM_txt_embedding(LLM *self, PyObject *args) {
+    if (!self->is_embedding) {
+        Py_RETURN_NONE;
+    }
+    const char* query = NULL;
+    if (!PyArg_ParseTuple(args, "s", &query)) {
+        Py_RETURN_NONE;
+    }
+    auto embeds = getVar();
+    *(embeds->var) = ((MNN::Transformer::Embedding*)self->llm)->txt_embedding(query);
+    return (PyObject *)embeds;
+}
+
 static PyMethodDef PyMNNLLM_methods[] = {
     {"load", (PyCFunction)PyMNNLLM_load, METH_VARARGS, "load model."},
     {"forward", (PyCFunction)PyMNNLLM_forward, METH_VARARGS, "forward `logits` by `input_ids`."},
     {"generate", (PyCFunction)PyMNNLLM_generate, METH_VARARGS, "generate `output_ids` by `input_ids`."},
     {"response", (PyCFunction)PyMNNLLM_response, METH_VARARGS, "response `query` without hsitory."},
+    {"get_current_history", (PyCFunction)PyMNNLLM_getCurrentHistory, METH_VARARGS, "Get Current History."},
+    {"erase_history", (PyCFunction)PyMNNLLM_eraseHistory, METH_VARARGS, "Erase History."},
     {"tokenizer_encode", (PyCFunction)PyMNNLLM_tokenizer_encode, METH_VARARGS, "tokenizer encode."},
     {"tokenizer_decode", (PyCFunction)PyMNNLLM_tokenizer_decode, METH_VARARGS, "tokenizer decode."},
+    {"txt_embedding", (PyCFunction)PyMNNLLM_txt_embedding, METH_VARARGS, "txt embedding."},
     {NULL}  /* Sentinel */
 };
 
@@ -131,14 +182,21 @@ static PyObject* PyMNNLLM_create(PyObject *self, PyObject *args) {
         return NULL;
     }
     const char* path = NULL;
-    if (!PyArg_ParseTuple(args, "s", &path)) {
+    int embedding_model = 0;
+    if (!PyArg_ParseTuple(args, "s|p", &path, &embedding_model)) {
         return NULL;
     }
     LLM *llm = (LLM *)PyObject_Call((PyObject*)&PyMNNLLM, PyTuple_New(0), NULL);
     if (!llm) {
         return NULL;
     }
-    llm->llm = MNN::Transformer::Llm::createLLM(path);
+    if (embedding_model) {
+        llm->llm = MNN::Transformer::Embedding::createEmbedding(path);
+        llm->is_embedding = true;
+    } else {
+        llm->llm = MNN::Transformer::Llm::createLLM(path);
+    }
+
     return (PyObject*)llm;
 }
 

@@ -18,7 +18,7 @@
 #include "MNN_generated.h"
 
 #ifdef MNN_KLEIDIAI_ENABLED
-#include "arm/kleidiAI/mnn_kleidiai.h"
+#include "arm/mnn_kleidiai.h"
 #endif
 
 namespace MNN {
@@ -236,6 +236,9 @@ private:
         static name _temp;\
         CPUBackend::addCreator(opType, &_temp); \
     }
+
+#define REGISTER_CPU_OP_CREATOR_AUDIO(name, opType) \
+    REGISTER_CPU_OP_CREATOR(name, opType)
 
 } // namespace MNN
 

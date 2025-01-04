@@ -80,7 +80,7 @@ private:
 
 class OpenCLBackend : public Backend {
 public:
-    OpenCLBackend(std::shared_ptr<ImagePool>imgPool, std::shared_ptr<BufferPool> bufPool, const CLRuntime *runtime);
+    OpenCLBackend(BackendConfig::PrecisionMode precision, BackendConfig::MemoryMode memory, std::shared_ptr<ImagePool>imgPool, std::shared_ptr<BufferPool> bufPool, const CLRuntime *runtime);
     ~OpenCLBackend();
 
     OpenCLRuntime *getOpenCLRuntime();
@@ -153,7 +153,7 @@ private:
     void copyToDeviceInt8(const Tensor* srcTensor, const Tensor* dstTensor) const;
     void copyBetweenDevice(const Tensor* srcTensor, const Tensor* dstTensor) const;
 
-    void _allocHostBuffer(int length, const Tensor* srcTensor) const;
+    bool _allocHostBuffer(int length, const Tensor* srcTensor) const;
 
     const CLRuntime* mCLRuntime;
 
@@ -162,6 +162,7 @@ private:
 
     ImagePool* mImagePool;
     BufferPool* mBufferPool;
+    std::shared_ptr<BufferExecutionPool> mExecutionBufferPool;
 
     std::shared_ptr<ImagePool> mImagePoolFirst;
     std::shared_ptr<BufferPool> mBufferPoolFirst;
@@ -171,8 +172,6 @@ private:
     std::shared_ptr<OpenCLRuntime> mOpenCLRuntime;
 
     mutable std::pair<int, std::shared_ptr<cl::Buffer>> mHostBuffer;
-    mutable cl::Buffer *mDeviceBuffer = nullptr;
-    mutable std::shared_ptr<cl::Image> mDeviceTexture;
     BackendConfig::PrecisionMode mPrecision;
     BackendConfig::MemoryMode mMemory;
     bool mIsCreateError{false};
@@ -231,6 +230,26 @@ public:
                                 Backend *backend) const override {
         return new T(inputs, op, backend);
     }
+};
+
+class CLSharedMemReleaseBuffer : public Backend::MemObj {
+public:
+    CLSharedMemReleaseBuffer(uint64_t sharedId, cl::Buffer *bId) {
+        mSharedId = sharedId;
+        mBuffer = bId;
+    }
+    virtual ~ CLSharedMemReleaseBuffer() {
+        delete mBuffer;
+    }
+    uint64_t getSharedId(){
+        return mSharedId;
+    }
+    cl::Buffer *getMem(){
+        return mBuffer;
+    }
+private:
+    uint64_t mSharedId;
+    cl::Buffer *mBuffer;
 };
 
 } // namespace OpenCL

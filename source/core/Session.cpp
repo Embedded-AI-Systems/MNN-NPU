@@ -99,6 +99,10 @@ void Session::ModeGroup::setHint(Interpreter::HintMode mode, int hint) {
             break;
         case Interpreter::OP_ENCODER_NUMBER_FOR_COMMIT:
             runtimeHint.encorderNumForCommit = hint;
+        case Interpreter::MMAP_FILE_SIZE:
+            runtimeHint.mmapFileSize = hint;
+        case Interpreter::USE_CACHED_MMAP:
+            runtimeHint.useCachedMmap = hint;
         default:
             break;
     }
@@ -234,15 +238,6 @@ ErrorCode Session::runWithCallBack(const TensorCallBackWithInfo& before, const T
     return NO_ERROR;
 }
 
-void Session::_clearCache() {
-    for (auto& t : mInfo.allTensors) {
-        auto describe = TensorUtils::getDescribe(t.get());
-        if (describe->usage == Tensor::InsideDescribe::TRAINABLE || describe->usage == Tensor::InsideDescribe::CONSTANT) {
-            continue;
-        }
-        describe->regions.clear();
-    }
-}
 
 ErrorCode Session::resize() {
 #ifdef LOG_VERBOSE

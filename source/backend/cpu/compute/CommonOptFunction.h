@@ -313,7 +313,7 @@ struct CoreFunctions {
     void(*MNNPoolingMax)(const void* channelInput, int inputWidth, int inputHeight, void *channelOutput,
                            int outputWidth, int outputHeight, int kernelWidth, int kernelHeight, int strideWidth,
                            int strideHeight, int padWidth, int padHeight, int padType, int countType);
-    
+
     void(*MNNPoolingMaxWithRedice)(const void* channelInput, int inputWidth, int inputHeight, void *channelOutput,
                            int outputWidth, int outputHeight, int kernelWidth, int kernelHeight, int strideWidth,
                            int strideHeight, int padWidth, int padHeight, int padType, int countType, int *RediceOutput);
