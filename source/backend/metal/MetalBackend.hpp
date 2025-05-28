@@ -61,6 +61,9 @@ public:
     std::map<std::pair<std::string, std::vector<uint32_t>>, std::tuple<std::vector<uint32_t>, std::vector<uint32_t>,  uint32_t>>& getTunedThreadGroup() {
         return mTunedThreadGroup;
     };
+    std::map<std::string, std::vector<std::pair<std::vector<uint32_t>, std::tuple<std::vector<uint32_t>, std::vector<uint32_t>, uint32_t>>>>& getTunedThreadGroupVec() {
+        return mTunedThreadGroupVec;
+    }
     virtual Backend *onCreate(const BackendConfig* config, Backend* origin) const override;
     virtual void onGabageCollect(int level) override;
     virtual CompilerType onGetCompilerType() const override {
@@ -88,6 +91,7 @@ private:
     mutable std::vector<SingleBufferWithAllocator> mDynamic;
     MetalTuneLevel mTuneLevel = Wide;
     std::map<std::pair<std::string, std::vector<uint32_t>>, std::tuple<std::vector<uint32_t>, std::vector<uint32_t>, uint32_t>> mTunedThreadGroup;
+    std::map<std::string, std::vector<std::pair<std::vector<uint32_t>, std::tuple<std::vector<uint32_t>, std::vector<uint32_t>, uint32_t>>>> mTunedThreadGroupVec;
 
 private:
     id<MTLCommandQueue> mQueue = nil;
@@ -152,6 +156,8 @@ public:
      */
     static void addCreator(OpType type, Creator *creator);
     static void setTensor(const MNN::Tensor* tensor, id<MTLComputeCommandEncoder> encoder, int index);
+    static void setMem(const MemChunk& chunk, id<MTLComputeCommandEncoder> encoder, int index);
+    static uint8_t* getMemPtr(const MemChunk& chunk);
     static std::pair<id<MTLBuffer>, int> getBuffer(const MNN::Tensor* tensor);
     size_t getTensorSizeInBytes(const Tensor* tensor) const;
     virtual bool onSelectDynamicAllocator(int index, int maxIndex) override;
@@ -206,6 +212,7 @@ public:
     EagerBufferAllocator *getStaticBufferPool() const {
         return mStaticBufferPool.get();
     }
+    id<MTLCommandBuffer> getCommandBufferForBufferCopy() const;
 
     bool isCmdBufferCommit();
     bool isIphone(){
@@ -234,7 +241,6 @@ private:
     BackendConfig::MemoryMode mMemoryMode;
 private:
     MetalRuntimeAllocator::MetalBufferAlloc mEmptyMem;
-    id<MTLCommandBuffer> getCommandBufferForBufferCopy() const;
     id<MTLCommandBuffer> getCommandBufferForNet() const;
     id<MTLComputeCommandEncoder> encoder_net() const;
     mutable id<MTLCommandBuffer> _commandBuffer = nil;

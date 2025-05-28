@@ -11,10 +11,10 @@
 
 #include <stdint.h>
 #include <stdio.h>
-#ifdef __linux__
+#include "core/Macro.h"
+#if defined(__linux__) || defined(__QNXNTO__)
  #include <sys/types.h>
 #endif
-#include "core/Macro.h"
 #ifdef __cplusplus
 extern "C" {
 #endif

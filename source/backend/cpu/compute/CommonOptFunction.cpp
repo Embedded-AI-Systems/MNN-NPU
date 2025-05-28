@@ -27,6 +27,11 @@
 #define FLOAT float
 using Vec = MNN::Math::Vec<float, 4>;
 #include "../GridSampler.hpp"
+#ifdef MNN_LOW_MEMORY
+#ifdef __aarch64__
+#include "backend/cpu/arm/arm64/low_memory/MNNDynamicQuantFunctions.hpp"
+#endif
+#endif
 
 #ifndef MNN_USE_SSE
 void MNNInt8ToInt16(int16_t* dest, const int8_t* source, size_t count) {
@@ -194,20 +199,6 @@ void MNNPackedMatMulRemain_int8(float* C, const float* A, const float* B, size_t
 #endif // MNN_CPU_WEIGHT_DEQUANT_GEMM
 
 #ifdef MNN_LOW_MEMORY
-void MNNAbsMaxFP32(const float* source, float* absmax, size_t src_depth_quad, size_t realSize, int pack) {
-    // source: (ic/4, N, 4)
-    auto srcStep = pack * realSize;
-    for (int i = 0; i < realSize; ++i) {
-        float absmaxVal = 0.f; // absmaxVal>=0
-        for (int c = 0; c < src_depth_quad; ++c) {
-            auto src = source + c * srcStep + i * pack;
-            for (int k = 0; k < pack; ++k) {
-                absmaxVal = std::max(absmaxVal, std::abs(src[k]));
-            }
-        }
-        absmax[i] = absmaxVal;
-    }
-}
 void MNNQuantScaleFP32(float* absmax, float* quant_scale, float* dequant_scale, size_t thread, size_t batch) {
     for (int i = 0; i < batch; ++i) {
         auto absmaxPtr = absmax + i;
@@ -224,17 +215,70 @@ void MNNQuantScaleFP32(float* absmax, float* quant_scale, float* dequant_scale, 
         }
     }
 }
-void MNNQuantSumFP32(float* sum, const float* dequant_scale, size_t thread, size_t batch) {
-    for (int i = 0; i < batch; ++i) {
-        auto sumPtr = reinterpret_cast<int*>(sum) + i;
-        int sumVal = 0.f;
-        for (int t = 0; t < thread; ++t) {
-            sumVal += sumPtr[t * batch];
-        }
-        sum[i] = sumVal * dequant_scale[i];
+
+void MNNDynamicUpdateConvBiasScale(float* newbias, float* oldbias, float* weightKernelSum, float* inputBias, size_t ocQuad) {
+    int ocUp4 = 4 * ocQuad;
+    int pack = 4;
+    for (int i = 0; i < ocUp4; ++i) {
+        newbias[i] = oldbias[i] + weightKernelSum[i] * inputBias[0];
     }
 }
-void MNNDynamicQuantFP32(const float* src, int8_t* dst, const float* scale, size_t src_depth_quad, size_t realSize, int pack) {
+
+#endif // LOW_MEMORY
+#endif // not __aarch64__
+
+static void MNNCountMaxMinValue(const float* source, float* minVal, float* maxVal, size_t size) {
+    int pack = 4;
+    float max_ = source[0], min_ = source[0];
+    for (int i = 1; i < size; ++i) {
+        if (max_ < source[i]) {
+            max_ = source[i];
+        }
+        if (min_ > source[i]) {
+            min_ = source[i];
+        }
+    }
+    *minVal = min_;
+    *maxVal = max_;
+}
+
+#ifdef MNN_LOW_MEMORY
+static void MNNAbsMaxFP32(const float* source, float* absmax, size_t src_depth_quad, size_t realSize, int pack) {
+#ifdef __aarch64__
+    if (pack == 4) {
+        MNNAbsMaxFP32_Pack4(source, absmax, src_depth_quad, realSize, pack);
+        return;
+    }
+    if (pack == 8) {
+        MNNAbsMaxFP32_Pack8(source, absmax, src_depth_quad, realSize, pack);
+        return;
+    }
+#endif
+    // source: (ic/4, N, 4)
+    auto srcStep = pack * realSize;
+    for (int i = 0; i < realSize; ++i) {
+        float absmaxVal = 0.f; // absmaxVal>=0
+        for (int c = 0; c < src_depth_quad; ++c) {
+            auto src = source + c * srcStep + i * pack;
+            for (int k = 0; k < pack; ++k) {
+                absmaxVal = std::max(absmaxVal, std::abs(src[k]));
+            }
+        }
+        absmax[i] = absmaxVal;
+    }
+}
+
+void MNNDynamicQuantFP32(const float* src, int8_t* dst, const float* scale, size_t src_depth_quad, size_t realSize, int pack, const float* bias = nullptr) {
+#ifdef __aarch64__
+    if (pack == 4) {
+        MNNDynamicQuantFP32_Pack4(src, dst, scale, src_depth_quad, realSize, nullptr, pack);
+        return;
+    }
+    if (pack == 8) {
+        MNNDynamicQuantFP32_Pack8(src, dst, scale, src_depth_quad, realSize, nullptr, pack);
+        return;
+    }
+#endif
 #ifdef MNN_USE_SSE
     uint8_t* dstPtr = reinterpret_cast<uint8_t*>(dst);
     int offset = 128;
@@ -255,23 +299,381 @@ void MNNDynamicQuantFP32(const float* src, int8_t* dst, const float* scale, size
     }
 }
 
-void MNNDynamicUpdateConvBiasScale(float* newbias, float* newscale, float* oldbias, float* weightScale, float* inputScale, float* weightKernelSum, float* inputZero, size_t ocQuad, size_t scaleSize) {
-    int ocUp4 = 4 * ocQuad;
-    int pack = 4;
-    int blockNum = scaleSize / ocUp4;
-    for (int i = 0; i < ocUp4; ++i) {
-        newbias[i] = oldbias[i] - weightKernelSum[i] * inputZero[0];
+static void MNNAsyQuantFunc(int8_t* dst, const float* src, float* qscale, float* qbias, const size_t* info) {
+    // input shape: [kernelsize, blockNum, blockLU, EP, LP]
+    auto blockNum = info[0];
+    auto EP = info[1];        // real area for data
+    auto LP = info[2];        // Innermost data layout, may come from backend's pack or gemmint8 units' SRC_UNIT
+    auto DST_XUNIT = info[3]; // backend gemmint8 units
+    auto SRC_UNIT = info[4];
+    auto kernelsize = info[5];
+    auto blockLU = info[6];
+    auto stride0 = blockNum * blockLU * EP * LP;
+    auto stride1 = blockLU * EP * LP;
+    int int8Max = 127;
+    int int8Min = -128;
+    // qscale&qbias [blockNum, EP]
+#ifdef __aarch64__
+    if (LP == 4 || LP == 8) {
+        for (int k = 0; k < kernelsize; ++k) {
+            for (int i = 0; i < blockNum; ++i) {
+                if (LP == 4) {
+                    MNNDynamicQuantFP32_Pack4(src + k * stride0 + i * stride1, dst + k * stride0 + i * stride1, qscale + i * EP, blockLU, EP, qbias + i * EP, LP);
+                }
+                if (LP == 8) {
+                    MNNDynamicQuantFP32_Pack8(src + k * stride0 + i * stride1, dst + k * stride0 + i * stride1, qscale + i * EP, blockLU, EP, qbias + i * EP, LP);
+                }
+            }
+        }
+        return;
     }
-    for (int k = 0; k < blockNum; ++k) {
-        for (int i = 0; i < ocUp4; ++i) {
-           newscale[i + k * ocUp4] = weightScale[i + k * ocUp4] * inputScale[0];
+#endif
+    for (int i = 0; i < EP; ++i) {
+        for (int bk = 0; bk < blockNum; ++bk) {
+            float quant_scale = qscale[i + bk * EP];
+            float quant_bias  = qbias[i + bk * EP];
+            for (int n = 0; n < kernelsize; ++n) {
+                for (int k = 0; k < blockLU; ++k) {
+                    for (int j = 0; j < LP; ++j) {
+                        int dataIndx = n * stride0 + bk * stride1 + k * EP * LP + i * LP + j;
+                        float data_ = src[dataIndx];
+                        int qval = static_cast<int32_t>(roundf(data_ * quant_scale + quant_bias));
+#ifdef MNN_USE_SSE
+                        ((uint8_t*)dst)[dataIndx] = qval + 128;
+#else
+                        dst[dataIndx] = ALIMIN(int8Max, ALIMAX(int8Min, qval));
+#endif
+                    }
+                }
+            }
         }
     }
 }
 
-#endif // LOW_MEMORY
-#endif // not __aarch64__
+static void MNNAsyQuantInfo_FP32(float* scale, float* bias, float* qscale, float* qbias, float* dstMin, float* dstMax, const float* src, const size_t* info) {
+    auto blockNum = info[0];
+    auto plane = info[1];        // real area for data
+    auto innerSide = info[2];    // Innermost data layout, may come from backend's pack or gemmint8 units' SRC_UNIT
+    auto DST_XUNIT = info[3];
+    auto kernelsize = info[5];
+    auto blockLU = info[6];
+    auto stride0 = blockNum * blockLU * plane * innerSide;
+    auto stride1 = blockLU * plane * innerSide;
+    
+    if (info[7] == 1) { // scale&bias:[1]
+        float maxval, minval;
+        MNNCountMaxMinValue(src, &minval, &maxval, kernelsize * stride0);
+        if (info[8] == 1 && (maxval -minval) > 1e-7) {
+            if (minval > 0.f) {
+                minval = 0;
+            } else if (maxval < 0.f){
+                maxval = 0;
+            }
+        }
+        auto range = maxval - minval;
+        if (range <= 1e-7) {
+            scale[0] = 0.f;
+            qscale[0] = 0.f;
+            qbias[0] = 0.f;
+            bias[0] = maxval;
+        } else {
+            qscale[0] = 255.f / range;
+            scale[0] = range / 255.f;
+            qbias[0] = roundf(-minval * 255.f / range)- 128.f;
+            bias[0] = -qbias[0] * scale[0];
+        }
+        return;
+    }
 
+    // input              : [kernelsize, blockNum, blockLU, plane, pack]
+    // dequant scale/bias : [EU, blockNum, step], step=ALIMIN(step, EP), EU=UP_DIV(plane, EP)
+    // quant scale/bias   : [blockNum, plane]
+#ifdef __aarch64__
+    if (DST_XUNIT == 12 && innerSide == 4) { // Arm82,fp32: SRC_UNIT=4, core->pack=4
+        // max,min shape: [blockNum, EP]
+        for (int i = 0; i < kernelsize; ++i) {
+            MNNLocalMinMaxFP32_Pack4(dstMin, dstMax, src + i * stride0, blockNum, blockLU, plane, innerSide, i);
+        }
+        // scale, bias
+        bool success = MNNAsyLocalQuantInfo_EP12_FP32(scale, bias, qscale, qbias, dstMin, dstMax, info);
+        if (!success) {
+            MNN_ERROR("Call error for:MNNAsyLocalQuantInfo_EP12\n");
+            return;
+        }
+        return;
+    }
+    if (DST_XUNIT == 10) { // Arm86,fp32: SRC_UNIT=8,core->pack=4
+        // max,min shape: [blockNum, EP]
+        if (innerSide == 4) {
+            for (int i = 0; i < kernelsize; ++i) {
+                MNNLocalMinMaxFP32_Pack4(dstMin, dstMax, src + i * stride0, blockNum, blockLU, plane, innerSide, i);
+            }
+        }
+        if (innerSide == 8) {
+            for (int i = 0; i < kernelsize; ++i) {
+                MNNLocalMinMaxFP32_Pack8(dstMin, dstMax, src + i * stride0, blockNum, blockLU, plane, innerSide, i);
+            }
+        }
+        // scale, bias
+        bool success = MNNAsyLocalQuantInfo_EP10_FP32(scale, bias, qscale, qbias, dstMin, dstMax, info);
+        if (!success) {
+            MNN_ERROR("Call error for:MNNAsyLocalQuantInfo_EP10\n");
+            return;
+        }
+        return;
+    }
+#endif
+    // max,min shape: [blockNum, plane]
+    for (int i = 0; i < plane; ++i) {
+        for (int bk = 0; bk < blockNum; ++bk) {
+            auto idx0 = i *innerSide + bk * stride1;
+            float max_ = src[idx0];
+            float min_ = max_;
+            for (int n = 0; n < kernelsize; ++n) {
+                for (int k = 0; k < blockLU; ++k) {
+                    for (int j = 0; j < innerSide; ++j) {
+                        auto dataIndx = idx0 + n * stride0 + k * (plane * innerSide) + j;
+                        float data_ = src[dataIndx];
+                        max_ = ALIMAX(max_, data_);
+                        min_ = ALIMIN(min_, data_);
+                    }
+                }
+            }
+            auto sindx = i + bk * plane;
+            dstMin[sindx] = min_;
+            dstMax[sindx] = max_;
+        }
+    }
+    // scale, bias
+    for (int i = 0; i < plane; ++i) {
+        auto step = ALIMIN(DST_XUNIT, plane - (i / DST_XUNIT) * DST_XUNIT);
+        auto sind0 = (i / DST_XUNIT) * DST_XUNIT * blockNum + (i % DST_XUNIT);
+        for (int k = 0; k < blockNum; ++k) {
+            auto sind = sind0 + k * step;
+            auto qind = i + k * plane;
+            auto max_ = dstMax[qind];
+            auto min_ = dstMin[qind];
+            if (fabs(max_ - min_) < 1e-7) {
+                qscale[qind] = 0.f;
+                qbias[qind] = 0.f;
+                scale[sind] = 0.f;
+                bias[sind] = max_;
+            } else {
+                qscale[qind] = 255.f / (max_ - min_);
+                qbias[qind] = roundf(-min_ * 255.f / (max_ - min_)) - 128.0f;
+                scale[sind] = (max_ - min_) / 255.f;
+#ifndef MNN_USE_SSE
+                bias[sind] = min_ + (128.f / 255.f) * (max_ - min_);
+#else
+                bias[sind] = min_;
+#endif
+            }
+        }
+    }
+}
+#endif // MNN_LOW_MEMORY
+
+static void MNNReorderWeightInt4(uint8_t* dest, const uint8_t* source, int32_t* shape, size_t size, float* kernelsum) {
+    MNN_ASSERT(size > 4);
+    auto blocknum = shape[0];
+    auto hu       = shape[1];
+    auto lu       = shape[2];
+    auto hp       = shape[3];
+    auto lp       = shape[4];
+    auto ic       = blocknum * lu * lp;
+    auto stride0  = blocknum * hp * lu * lp;
+    auto stride1  = lu * hp * lp;
+    auto stride2  = hp * lp;
+    // [oc,ic]->[hu,blocknum,lu,hp,lp]
+    for (int i = 0; i < hu; ++i) {
+        for (int k = 0; k < hp; ++k) {
+            for (int bl = 0; bl < blocknum; ++bl) {
+                for (int j = 0; j < lu; ++j) {
+                    int srcindex = (i * hp + k) * ic + bl * (lu * lp) + j * lp;
+                    int dstindex = i * stride0 + bl * stride1 + j * stride2 + k * lp;
+                    memcpy(dest + dstindex, source + srcindex, lp);
+                }
+            }
+        }
+    }
+    // [hu,blocknum,lu,hp,lp] address [hp,lp] for int4
+    auto inside = lp * hp;
+    auto outside = blocknum * hu;
+    std::vector<uint8_t> buffer(inside);
+    for (int i = 0; i < outside; ++i) {
+        std::vector<float> accum(hp, 0);
+        for (int k = 0; k < lu; ++k) {
+            for (int j = 0; j < inside / 2; ++j) {
+                auto w0 = dest[j + (i * lu + k) * inside] >> 4;
+                auto w1 = dest[j + (i * lu + k) * inside] & 0x0f;
+                auto w2 = dest[(i * lu + k) * inside + j + inside / 2] >> 4;
+                auto w3 = dest[(i * lu + k) * inside + j + inside / 2] & 0x0f;
+                buffer[2 * j + 0] = w0 * 16 + w2;
+                buffer[2 * j + 1] = w1 * 16 + w3;
+                // sum
+                accum[j / lp] += ((float)w0 + (float)w1);
+                accum[(j + inside / 2) / lp] += ((float)w2 + (float)w3);
+            }
+            memcpy(dest + (i * lu + k) * inside, buffer.data(), inside);
+        }
+        memcpy(kernelsum + i * hp, accum.data(), hp * sizeof(float));
+    }
+}
+#ifdef __aarch64__
+static void MNNReorderWeightInt4Arm86(uint8_t* dest, const uint8_t* source, int32_t* shape, size_t size, float* kernelsum) {
+    MNN_ASSERT(size > 4);
+    auto blocknum = shape[0];
+    auto hu       = shape[1];
+    auto lu       = shape[2];
+    auto hp       = shape[3];
+    auto lp       = shape[4];
+    auto ic       = blocknum *lu * lp;
+    auto stride0  = blocknum * hp * lu * lp;
+    auto stride1  = lu * hp * lp;
+    auto stride2  = hp * lp;
+    auto dstPtr   = (int32_t*)dest;
+    auto srcPtr   = (int32_t*)source;
+    int unitpacksize = sizeof(int32_t) / sizeof(uint8_t);
+
+    for (int i = 0; i < hu; ++i) {
+        for (int k = 0; k < hp; ++k) {
+            for (int bl = 0; bl < blocknum; ++bl) {
+                int j = 0;
+                while (j + 7 < lu) {
+                    auto srcindex0 = ((i * hp + k) * ic + bl * (lu * lp) + j * lp) / unitpacksize;
+                    auto srcindex1 = ((i * hp + k) * ic + bl * (lu * lp) + (j + 4) * lp) / unitpacksize;
+                    auto dstindex0 = (bl * stride1 + i * stride0 + j * stride2 + k * lp) / unitpacksize;
+                    auto dstindex1 = (bl * stride1 + i * stride0 + (j + 1) * stride2 + k * lp) / unitpacksize;
+                    auto dstindex2 = (bl * stride1 + i * stride0 + (j + 2) * stride2 + k * lp) / unitpacksize;
+                    auto dstindex3 = (bl * stride1 + i * stride0 + (j + 3) * stride2 + k * lp) / unitpacksize;
+                    auto dstindex4 = (bl * stride1 + i * stride0 + (j + 4) * stride2 + k * lp) / unitpacksize;
+                    auto dstindex5 = (bl * stride1 + i * stride0 + (j + 5) * stride2 + k * lp) / unitpacksize;
+                    auto dstindex6 = (bl * stride1 + i * stride0 + (j + 6) * stride2 + k * lp) / unitpacksize;
+                    auto dstindex7 = (bl * stride1 + i * stride0 + (j + 7) * stride2 + k * lp) / unitpacksize;
+                    j += 8;
+                    auto srcdata0 = vld1q_s32(srcPtr + srcindex0);
+                    auto srcdata1 = vld1q_s32(srcPtr + srcindex1);
+                    vst1q_lane_s32(dstPtr + dstindex0, srcdata0, 0);
+                    vst1q_lane_s32(dstPtr + dstindex1, srcdata0, 1);
+                    vst1q_lane_s32(dstPtr + dstindex2, srcdata0, 2);
+                    vst1q_lane_s32(dstPtr + dstindex3, srcdata0, 3);
+                    vst1q_lane_s32(dstPtr + dstindex4, srcdata1, 0);
+                    vst1q_lane_s32(dstPtr + dstindex5, srcdata1, 1);
+                    vst1q_lane_s32(dstPtr + dstindex6, srcdata1, 2);
+                    vst1q_lane_s32(dstPtr + dstindex7, srcdata1, 3);
+                }
+                while (j + 3 < lu) {
+                    auto srcindex = ((i * hp + k) * ic + bl * (lu * lp) + j * lp) / unitpacksize;
+                    auto dstindex0 = (bl * stride1 + i * stride0 + j * stride2 + k * lp) / unitpacksize;
+                    auto dstindex1 = (bl * stride1 + i * stride0 + (j + 1) * stride2 + k * lp) / unitpacksize;
+                    auto dstindex2 = (bl * stride1 + i * stride0 + (j + 2) * stride2 + k * lp) / unitpacksize;
+                    auto dstindex3 = (bl * stride1 + i * stride0 + (j + 3) * stride2 + k * lp) / unitpacksize;
+                    j += 4;
+                    auto srcdata = vld1q_s32(srcPtr + srcindex);
+                    vst1q_lane_s32(dstPtr + dstindex0, srcdata, 0);
+                    vst1q_lane_s32(dstPtr + dstindex1, srcdata, 1);
+                    vst1q_lane_s32(dstPtr + dstindex2, srcdata, 2);
+                    vst1q_lane_s32(dstPtr + dstindex3, srcdata, 3);
+                }
+                while (j < lu) {
+                    auto srcindex = ((i * hp + k) * ic + bl * (lu * lp) + j * lp) / unitpacksize;
+                    auto dstindex = (bl * stride1+ i * stride0 + j * stride2 + k * lp) / unitpacksize;
+                    dstPtr[dstindex] = srcPtr[srcindex];
+                    j++;
+                }
+            }
+        }
+    }
+    MNNPermuteSumWeightInt4Arm86(dest, dest, blocknum * hu, lu, kernelsum);
+}
+
+static void MNNReorderWeightInt4Arm82(uint8_t* dest, const uint8_t* source, int32_t* shape, size_t size, float* kernelsum) {
+    MNN_ASSERT(size > 4);
+    // dst shape: [hu, blocknum, kernelCount, lu, hp, lp], kernelCount=1 in this case
+    auto blocknum = shape[0];
+    auto hu       = shape[1];
+    auto lu       = shape[2];
+    auto hp       = shape[3];
+    auto lp       = shape[4];
+    auto ic       = blocknum *lu * lp;
+    auto stride0  = blocknum * hp * lu * lp;
+    auto stride1  = lu * hp * lp;
+    auto stride2  = hp * lp;
+    auto dstPtr   = (int16_t*)dest;
+    auto srcPtr   = (int16_t*)source;
+    int unitpacksize = sizeof(int16_t) / sizeof(uint8_t);
+    for (int i = 0; i < hu; ++i) {
+        for (int k = 0; k < hp; ++k) {
+            for (int bl = 0; bl < blocknum; ++bl) {
+                int j = 0;
+                while (j + 7 < lu) {
+                    auto srcindex = ((i * hp + k) * ic + bl * (lu * lp) + j * lp) / unitpacksize;
+                    auto dstindex0 = (bl * stride1 + i * stride0 + j * stride2 + k * lp) / unitpacksize;
+                    auto dstindex1 = (bl * stride1 + i * stride0 + (j + 1) * stride2 + k * lp) / unitpacksize;
+                    auto dstindex2 = (bl * stride1 + i * stride0 + (j + 2) * stride2 + k * lp) / unitpacksize;
+                    auto dstindex3 = (bl * stride1 + i * stride0 + (j + 3) * stride2 + k * lp) / unitpacksize;
+                    auto dstindex4 = (bl * stride1 + i * stride0 + (j + 4) * stride2 + k * lp) / unitpacksize;
+                    auto dstindex5 = (bl * stride1 + i * stride0 + (j + 5) * stride2 + k * lp) / unitpacksize;
+                    auto dstindex6 = (bl * stride1 + i * stride0 + (j + 6) * stride2 + k * lp) / unitpacksize;
+                    auto dstindex7 = (bl * stride1 + i * stride0 + (j + 7) * stride2 + k * lp) / unitpacksize;
+                    j += 8;
+                    auto srcdata = vld1q_s16(srcPtr + srcindex);
+                    vst1q_lane_s16(dstPtr + dstindex0, srcdata, 0);
+                    vst1q_lane_s16(dstPtr + dstindex1, srcdata, 1);
+                    vst1q_lane_s16(dstPtr + dstindex2, srcdata, 2);
+                    vst1q_lane_s16(dstPtr + dstindex3, srcdata, 3);
+                    vst1q_lane_s16(dstPtr + dstindex4, srcdata, 4);
+                    vst1q_lane_s16(dstPtr + dstindex5, srcdata, 5);
+                    vst1q_lane_s16(dstPtr + dstindex6, srcdata, 6);
+                    vst1q_lane_s16(dstPtr + dstindex7, srcdata, 7);
+                }
+                while (j + 3 < lu) {
+                    auto srcindex = ((i * hp + k) * ic + bl * (lu * lp) + j * lp) / unitpacksize;
+                    auto dstindex0 = (bl * stride1 + i * stride0 + j * stride2 + k * lp) / unitpacksize;
+                    auto dstindex1 = (bl * stride1 + i * stride0 + (j + 1) * stride2 + k * lp) / unitpacksize;
+                    auto dstindex2 = (bl * stride1 + i * stride0 + (j + 2) * stride2 + k * lp) / unitpacksize;
+                    auto dstindex3 = (bl * stride1 + i * stride0 + (j + 3) * stride2 + k * lp) / unitpacksize;
+                    j += 4;
+                    auto srcdata = vld1_s16(srcPtr + srcindex);
+                    vst1_lane_s16(dstPtr + dstindex0, srcdata, 0);
+                    vst1_lane_s16(dstPtr + dstindex1, srcdata, 1);
+                    vst1_lane_s16(dstPtr + dstindex2, srcdata, 2);
+                    vst1_lane_s16(dstPtr + dstindex3, srcdata, 3);
+                    
+                }
+                while (j < lu)
+                {
+                    auto srcindex = ((i * hp + k) * ic + bl * (lu * lp) + j * lp) / 2;
+                    auto dstindex = (bl * stride1 + i * stride0 + j * stride2 + k * lp) / 2;
+                    dstPtr[dstindex] = srcPtr[srcindex];
+                    j++;
+                }
+            }
+        }
+    }
+    MNNPermuteSumWeightInt4Arm82(dest, dest, blocknum * hu, lu, kernelsum);
+}
+#endif // __aarch64__
+
+static void MNNSumWeightInt8(float* kernelsum, int8_t* source, size_t outside, size_t reduceAxis, size_t hP, size_t lP) {
+    // weight shape: [outside, axis, hP, lP]
+    // outside    = blocknum * hU
+    // reduceAxis = kernelCount * lU
+    auto inside = hP * lP;
+    auto stride0 = inside * reduceAxis;
+    std::vector<float> accum(hP);
+    for (int i = 0; i < outside; ++i) {
+        memset(accum.data(), 0, hP * 4);
+        for (int j = 0; j < reduceAxis; ++j) {
+            for (int k = 0; k < hP; ++k) {
+                for (int x = 0; x < lP; ++x) {
+                    accum[k] += (float)source[x + k * lP + j * inside + i * stride0];
+                }
+            }
+        }
+        memcpy(kernelsum + i * hP, accum.data(), hP * sizeof(float));
+    }
+}
 
 static void MNNSumByAxisLForMatmul_A(float* dest, int8_t* source, const float* scale, ssize_t realDstCount, SumByAxisParams sumParams) {
 #ifdef MNN_USE_SSE
@@ -280,36 +682,49 @@ static void MNNSumByAxisLForMatmul_A(float* dest, int8_t* source, const float* s
     int8_t* srcInt8 = source;
 #endif
     auto scalePtr = scale;
-    auto kernelCountUnitDouble = sumParams.kernelCountUnitDouble;
     auto blockNum = sumParams.blockNum;
     auto EP = sumParams.DST_XUNIT;
     auto LP = sumParams.SRC_UNIT;
-    auto blockSizeQuad = kernelCountUnitDouble / blockNum;
-    auto col_buffer_unit_size = sumParams.col_buffer_unit_size;
+    auto col_buffer_unit_size = sumParams.unitColBufferSize;
     auto oneScale = sumParams.oneScale;
+    auto LU = sumParams.LU;
+    auto valid = sumParams.valid;
+    auto kernelxy = sumParams.kernelxy;
+    auto blockSizeQuad = LU / blockNum;
+    auto inputBlockQuant = sumParams.inputBlock;
+    auto lastL = LP;
+    if (valid) {
+        lastL = valid;
+    }
+    float singlescale = scale[0];
     do {
         int step = ALIMIN(EP, realDstCount);
+        int scaleOffset = inputBlockQuant ? (step * blockNum) : step;
 
         for (int k = 0; k < blockNum; ++k) {
-            // const auto src_x   = srcInt8 + w * LP;
-            const auto src_x = srcInt8 + k * (step * LP * blockSizeQuad);
+            const auto src_x = srcInt8 + k * (step * LP * blockSizeQuad * kernelxy);
             for (int w = 0; w < step; ++w) {
-                float dequantScale = scale[0];
-                if (oneScale == 0) {
+                float dequantScale = singlescale;
+                if (oneScale == 0 && inputBlockQuant) {
+                    dequantScale = scalePtr[w + k * step];
+                } else if (oneScale == 0) {
                     dequantScale = scalePtr[w];
                 }
                 int sumint32 = 0;
                 const auto src_y = src_x + w * LP;
-                for (int j = 0; j < blockSizeQuad; ++j) {
-                    const auto src_z = src_y + j * (step * LP);
-                    for (int i = 0; i < LP; ++i) {
-                        sumint32 += src_z[i];
+                for (int j = 0; j < kernelxy; ++j) {
+                    for (int i = 0; i < blockSizeQuad; ++i) {
+                        auto sumsize = i == (blockSizeQuad - 1) ? lastL : LP;
+                        const auto src_z = src_y + j * (blockSizeQuad * step * LP) + i * step * LP;
+                        for (int x = 0; x < sumsize; ++x) {
+                            sumint32 += src_z[x];
+                        }
                     }
                 }
                 dest[w + k * step] = dequantScale * static_cast<float>(sumint32);
             }
         }
-        scalePtr += step;
+        scalePtr += scaleOffset;
 
         dest += (step * blockNum);
         realDstCount -= step;
@@ -715,21 +1130,6 @@ void MNNAccumulateSequenceNumber (float* dst, const float* src, int size) {
         src += 1;
     }
     *dst = sum;
-}
-
-void MNNCountMaxMinValue(float* source, float* minVal, float* maxVal, size_t size) {
-    int pack = 4;
-    float max_ = source[0], min_ = source[0];
-    for (int i = 1; i < size; ++i) {
-        if (max_ < source[i]) {
-            max_ = source[i];
-        }
-        if (min_ > source[i]) {
-            min_ = source[i];
-        }
-    }
-    *minVal = min_;
-    *maxVal = max_;
 }
 
 #ifndef MNN_USE_NEON
@@ -1947,10 +2347,12 @@ void MNNExpC8(float* dest, const float* source, float* offset, const float* para
         int div2       = (div + 127) << 23;
         auto xReamin   = x - div * param;
         float expBasic = *(float*)(&div2);
-        auto t = xReamin;
+        auto t = xReamin * 0.25f;
         auto expRemain =
-            ((((parameters[7] * t + parameters[6]) * t + parameters[5]) * t + parameters[4]) * t + parameters[3]) * t +
-            parameters[2];
+        ((((parameters[7] * t + parameters[6]) * t + parameters[5]) * t + parameters[4]) * t + 1.0f) * t +
+            1.0f;
+        expRemain = expRemain * expRemain;
+        expRemain = expRemain * expRemain;
         dest[i] = expBasic * expRemain + offset[1];
         summer+= dest[i];
     }
@@ -2125,8 +2527,16 @@ void MNNNorm(float *dst, const float *src, const float *gamma, const float *beta
     for (int j = 0; j < size; ++j) {
         square_sum += (src[j] - mean) * (src[j] - mean);
     }
+#ifdef __aarch64__
+    auto vs = vadd_f32(vdiv_f32(vdup_n_f32(square_sum), vdup_n_f32(size)), vdup_n_f32(epsilon));
+    auto vecs = vdiv_f32(vdup_n_f32(1.0f), vsqrt_f32(vs));
+    float vars[2];
+    vst1_f32(vars, vecs);
+    float variable = vars[0];
+#else
     float variable = square_sum / size;
     variable = 1.f / std::sqrt(variable + epsilon);
+#endif
 
     if (gamma && beta) {
         for (int j = 0; j < size; ++j) {
@@ -2506,8 +2916,8 @@ void MNNPackTranspose(float* dst, const float* src, size_t area, size_t depth, i
 void MNNExp(float* dst, const float* src, float* offset, size_t dataSize) {
     int countC8        = static_cast<int32_t>(dataSize) / 8;
     int remain = static_cast<int32_t>(dataSize) % 8;
-    float parameters[] = {
-        (float)logf(2.0f), 1.0f / (float)logf(2.0f), 1.0f, 1.0f, 0.5f, 1.0f / 6.0f, 1.0f / 24.0f, 1.0f / 120.0f};
+    static const float parameters[] = {
+        (float)logf(2.0f), 1.0f / (float)logf(2.0f), 0.25f, 1.0f, 0.5f, 1.0f / 6.0f, 1.0f / 24.0f, 1.0f / 120.0f};
     if (countC8 > 0) {
         // Align to eight so asm is easier to write
         MNNExpC8(dst, src, offset, parameters, countC8);
@@ -2526,10 +2936,12 @@ void MNNExp(float* dst, const float* src, float* offset, size_t dataSize) {
             int div2       = (div + 127) << 23;
             auto xReamin   = x - div * param;
             float expBasic = *(float*)(&div2);
-            auto t = xReamin;
+            auto t = xReamin * 0.25f;
             auto expRemain =
-                ((((parameters[7] * t + parameters[6]) * t + parameters[5]) * t + parameters[4]) * t + parameters[3]) * t +
-                parameters[2];
+            ((((parameters[7] * t + parameters[6]) * t + parameters[5]) * t + parameters[4]) * t + 1.0f) * t +
+                1.0f;
+            expRemain = expRemain * expRemain;
+            expRemain = expRemain * expRemain;
             dest[i] = expBasic * expRemain + offset[1];
             summer+= dest[i];
         }
@@ -3189,6 +3601,37 @@ void MNNFp8ToFp16(uint16_t* dst, const uint8_t* src, size_t size) {
 #endif // USE_NEON
 }
 
+#ifdef MNN_LOW_MEMORY
+static void generalIm2col(float* destOrigin, float const** sourceGroup, const int32_t* info, const int32_t* el, int LP, int pack) {
+    // LP >= pack
+    int number = info[0];
+    int eReal = info[1];
+    int eDest = info[2];
+    int offset = info[3];
+    for (int n=0; n<number; ++n) {
+        int e = el[4 * n + 0];
+        int l = el[4 * n + 1];
+        int eOffset = el[4 * n + 2];
+        int lOffset = el[4 * n + 3];
+        int lC = lOffset / LP;
+        int lR = lOffset % LP;
+        auto dest = destOrigin + eOffset * LP + lC * eDest * LP + lR;
+        auto source = sourceGroup[n];
+
+        for (int y=0; y<e; ++y) {
+            auto yR = y % eDest;
+            for (int x=0; x<l; ++x) {
+                auto xR = x % pack;
+                auto xC = x / pack;
+                auto xOut = x / LP;
+                auto xIn = x % LP;
+                dest[xOut * eDest * LP + yR * LP + xIn] = source[xC * eReal * pack + y * pack * offset + xR];
+            }
+        }
+    }
+}
+#endif // MNN_LOW_MEMORY
+
 namespace MNN {
 
 static CoreFunctions* gCoreFunction = nullptr;
@@ -3244,7 +3687,9 @@ void MNNCoreFunctionInit() {
     gCoreFunction->MNNScaleAndAddBias = MNNScaleAndAddBias;
     gCoreFunction->MNNGridSampleComputeCord = MNNGridSampleComputeCord;
     gCoreFunction->MNNGridSampleInterp = MNNGridSampleInterp;
+#ifndef MNN_REDUCE_SIZE
     gCoreFunction->MNNGridSampleInterpGrad = MNNGridSampleInterpGrad;
+#endif
     gCoreFunction->MNNGridSampleComputeCord3D = MNNGridSampleComputeCord3D;
     gCoreFunction->MNNGridSampleInterp3D = MNNGridSampleInterp3D;
     gCoreFunction->MNNRoiPoolingMax = MNNRoiPoolingMax;
@@ -3263,7 +3708,9 @@ void MNNCoreFunctionInit() {
 #endif
     gCoreFunction->MNNSelectBinaryFunctionForFloat = CPUBinary::selectForFloat;
     gCoreFunction->MNNSelectUnaryFunctionForFloat = CPUUnary::selectForFloat;
+#ifdef MNN_SUPPORT_QUANT_EXTEND
     gCoreFunction->MNNSelectUnaryFunctionForInt8 = CPUUnary::selectForInt8;
+#endif
     gCoreFunction->MNNReluWithSlopeChannel = MNNReluWithSlopeChannel;
     gCoreFunction->MNNPoolingAvg = (decltype(gCoreFunction->MNNPoolingAvg))(poolingAvg<float, Vec4, 4>);
     // Set min value as 1 << 24
@@ -3296,21 +3743,40 @@ void MNNCoreFunctionInit() {
     gCoreFunction->supportSDot = gCPUInfo.dot;
     gCoreFunction->supportI8mm = gCPUInfo.i8mm;
     gCoreFunction->MNNSumByAxisLForMatmul_A = MNNSumByAxisLForMatmul_A;
+    gCoreFunction->MNNReorderWeightInt4 = MNNReorderWeightInt4;
+    gCoreFunction->MNNSumWeightInt8  = MNNSumWeightInt8;
+#ifdef __aarch64__
+   if (gCoreFunction->supportSDot) {
+       gCoreFunction->MNNReorderWeightInt4 = MNNReorderWeightInt4Arm82;
+       gCoreFunction->MNNSumWeightInt8 = MNNSumWeightInt8Arm82;
+   }
+   if (gCoreFunction->supportI8mm) {
+       gCoreFunction->MNNReorderWeightInt4 = MNNReorderWeightInt4Arm86;
+       gCoreFunction->MNNSumWeightInt8 = MNNSumWeightInt8Arm86;
+       
+   }
+#endif
 #ifdef MNN_CPU_WEIGHT_DEQUANT_GEMM
     // Weight Dequant Gemm Kernels
-    gCoreFunction->MNNPackedMatMul_int4 = MNNPackedMatMul_int4;
-    gCoreFunction->MNNPackedMatMulRemain_int4 = MNNPackedMatMulRemain_int4;
     gCoreFunction->MNNPackedMatMul_int8 = MNNPackedMatMul_int8;
     gCoreFunction->MNNPackedMatMulRemain_int8 = MNNPackedMatMulRemain_int8;
 #endif
 #ifdef MNN_LOW_MEMORY
-    // Dynamic Quant Helper Functions
-    gCoreFunction->MNNAbsMax = MNNAbsMaxFP32;
-    gCoreFunction->MNNDynamicQuant = MNNDynamicQuantFP32;
-    gCoreFunction->MNNQuantScale = MNNQuantScaleFP32;
-    gCoreFunction->MNNQuantSum = MNNQuantSumFP32;
-    // Dynamic Quan Bias
+    gCoreFunction->MNNAbsMax = MNNAbsMaxFP32;                      // abs max value for [icDiv4,plane,4] -> abs max:[plane]
+    gCoreFunction->MNNDynamicQuant = MNNDynamicQuantFP32;          // symmetric 'batch' quant for [icDiv4,plane,4]
+    gCoreFunction->MNNAsyQuantFunc = MNNAsyQuantFunc;              // asymmetric 'batch' quant for [icDiv4,plane,4]
+    gCoreFunction->MNNAsyQuantInfo = MNNAsyQuantInfo_FP32;              // asymmetric quant/dequant scale&bias for [icDiv4,plane,4] -> scale&bias:[blockNum,plane]
+    gCoreFunction->MNNQuantScale = MNNQuantScaleFP32;              // symmetric quant/dequant scale&bias for [icDiv4,plane,4] -> scale&bias:[plane]
+    gCoreFunction->MNNGeneralIm2Col = generalIm2col;               // Im2Col based on float data -> output:[eU,kernelsize,lU,ep,lp]
     gCoreFunction->MNNDynamicUpdateConvBiasScale = MNNDynamicUpdateConvBiasScale;
+#ifdef __aarch64__
+    if (gCoreFunction->supportSDot) {
+        gCoreFunction->MNNGeneralIm2Col = MNNGeneralIm2col_Fp32Arm82;
+    }
+    if (gCoreFunction->supportI8mm) {
+        gCoreFunction->MNNGeneralIm2Col = MNNGeneralIm2col_Fp32Arm86;
+    }
+#endif
 #endif
     MNNCoreInt8FunctionInit();
     MNNFunctionInit();

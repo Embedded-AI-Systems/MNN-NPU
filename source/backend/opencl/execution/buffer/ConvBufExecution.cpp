@@ -26,7 +26,7 @@ ConvBufCommonExecution::ConvBufCommonExecution(const Convolution2D *conv2dParams
     auto openclBackend       = (OpenCLBackend *)backend;
     int biasSize             = conv2dParams->common()->outputCount();
     int buffer_size = ROUND_UP(biasSize, 32);//pack to packN
-    if(openclBackend->getOpenCLRuntime()->isSupportedFP16()) {
+    if(openclBackend->getPrecision() != BackendConfig::Precision_High) {
         buffer_size *= sizeof(half_float::half);
     } else {
         buffer_size *= sizeof(float);
@@ -44,7 +44,7 @@ ConvBufCommonExecution::ConvBufCommonExecution(const Convolution2D *conv2dParams
         ::memset(biasPtrCL, 0, buffer_size);
         if (nullptr != conv2dParams->bias()) {
             const float *biasDataPtr = conv2dParams->bias()->data();
-            if(openclBackend->getOpenCLRuntime()->isSupportedFP16()){
+            if(openclBackend->getPrecision() != BackendConfig::Precision_High){
                 for(int i=0; i<biasSize; i++) {
                     ((half_float::half*)biasPtrCL)[i] = (half_float::half)(biasDataPtr[i]);
                 }
@@ -146,7 +146,7 @@ ConvBufExecution::ConvBufExecution(const std::vector<Tensor *> &inputs, const st
             Tensor::createDevice<float>({buffer_size}));
         mOpenCLBackend->onAcquireBuffer(mResource->mFilter.get(), Backend::STATIC);
 
-        if (mOpenCLBackend->getOpenCLRuntime()->isSupportedFP16()) {
+        if (mOpenCLBackend->getPrecision() != BackendConfig::Precision_High) {
             buffer_size *= sizeof(half_float::half);
         } else {
             buffer_size *= sizeof(float);
@@ -158,7 +158,7 @@ ConvBufExecution::ConvBufExecution(const std::vector<Tensor *> &inputs, const st
                 filterBuffer, true, CL_MAP_WRITE, 0, buffer_size, nullptr, nullptr, &error);
         if(nullptr != ptrCL && error == CL_SUCCESS){
             memset((void *)ptrCL, 0, buffer_size);
-            if (mOpenCLBackend->getOpenCLRuntime()->isSupportedFP16()) {
+            if (mOpenCLBackend->getPrecision() != BackendConfig::Precision_High) {
                 // [Ci, Co] ( [K, N] )
                 for (int o = 0; o < mResource->mOutputChannel; o++) {
                     for (int i = 0; i < mResource->mInputChannel; i++) {
@@ -209,7 +209,7 @@ ConvBufExecution::ConvBufExecution(const std::vector<Tensor *> &inputs, const st
             MNN::OpenCL::BufferConvertor bufferConvertor{mOpenCLBackend->getOpenCLRuntime()};
 
             bool needTrans = true;
-            bufferConvertor.convertToNC4HW4Buffer(filterBuffer.get(), MNN::OpenCL::CONV2D_FILTER, mResource->mFilter.get(), needTrans);
+            bufferConvertor.convertToNC4HW4Buffer(filterBuffer.get(), MNN::OpenCL::CONV2D_FILTER, mResource->mFilter.get(), mOpenCLBackend->getPrecision(), needTrans);
         }
     }
 
@@ -328,7 +328,7 @@ ErrorCode ConvBufExecution::onResize(const std::vector<Tensor *> &inputs, const 
             std::set<std::string> buildOptions;
             
             int m_pack = 4;
-            mPreKernel = mOpenCLBackend->getOpenCLRuntime()->buildKernel("gemm_buf", "transpose_pad", buildOptions);
+            mPreKernel = mOpenCLBackend->getOpenCLRuntime()->buildKernel("gemm_buf", "transpose_pad", buildOptions, mOpenCLBackend->getPrecision());
             uint32_t maxWorkGroupSize = static_cast<uint32_t>(mOpenCLBackend->getOpenCLRuntime()->getMaxWorkGroupSize(mPreKernel));
             mPreGlobalWorkSize = {static_cast<uint32_t>(alignM/m_pack), static_cast<uint32_t>(alignK/4)};
 
@@ -345,7 +345,7 @@ ErrorCode ConvBufExecution::onResize(const std::vector<Tensor *> &inputs, const 
             ret |= mPreKernel->get().setArg(idx++, openCLBuffer(input));
             ret |= mPreKernel->get().setArg(idx++, openCLBuffer(mConvGemmInpTensor.get()));
             MNN_CHECK_CL_SUCCESS(ret, "setArg mConvgemmOptLevel==1 PreKernel");
-            mPreLocalWorkSize = localWS2DDefault(mPreGlobalWorkSize, maxWorkGroupSize, mOpenCLBackend->getOpenCLRuntime(), "transpose_pad", mPreKernel).first;
+            mPreLocalWorkSize = localWS2DDefault(mPreGlobalWorkSize, maxWorkGroupSize, mOpenCLBackend->getOpenCLRuntime(), "transpose_pad", mPreKernel, mOpenCLBackend->getCLTuneLevel()).first;
 
             mOpenCLBackend->recordKernel2d(mPreKernel, mPreGlobalWorkSize, mPreLocalWorkSize);
             mPreGlobalWorkSize[0] = ROUND_UP(mPreGlobalWorkSize[0], std::max((uint32_t)1, mPreLocalWorkSize[0]));
@@ -369,7 +369,7 @@ ErrorCode ConvBufExecution::onResize(const std::vector<Tensor *> &inputs, const 
                 pack_m = 4;
             }
             buildOptions.emplace("-DM_VEC=" + std::to_string(pack_m));
-            mPostKernel = mOpenCLBackend->getOpenCLRuntime()->buildKernel("gemm_buf", "transpose_bias", buildOptions);
+            mPostKernel = mOpenCLBackend->getOpenCLRuntime()->buildKernel("gemm_buf", "transpose_bias", buildOptions, mOpenCLBackend->getPrecision());
             uint32_t maxWorkGroupSize = static_cast<uint32_t>(mOpenCLBackend->getOpenCLRuntime()->getMaxWorkGroupSize(mPostKernel));
 
             mPostGlobalWorkSize = {static_cast<uint32_t>(UP_DIV(M, pack_m)), static_cast<uint32_t>(UP_DIV(N, 4))};
@@ -389,7 +389,7 @@ ErrorCode ConvBufExecution::onResize(const std::vector<Tensor *> &inputs, const 
             ret |= mPostKernel->get().setArg(idx++, openCLBuffer(output));
 
             MNN_CHECK_CL_SUCCESS(ret, "setArg mConvgemmOptLevel==1 PostKernel");
-            mPostLocalWorkSize = localWS2DDefault(mPostGlobalWorkSize, maxWorkGroupSize, mOpenCLBackend->getOpenCLRuntime(), "transpose_bias", mPostKernel).first;
+            mPostLocalWorkSize = localWS2DDefault(mPostGlobalWorkSize, maxWorkGroupSize, mOpenCLBackend->getOpenCLRuntime(), "transpose_bias", mPostKernel, mOpenCLBackend->getCLTuneLevel()).first;
             mOpenCLBackend->recordKernel2d(mPostKernel, mPostGlobalWorkSize, mPostLocalWorkSize);
             mPostGlobalWorkSize[0] = ROUND_UP(mPostGlobalWorkSize[0], std::max((uint32_t)1, mPostLocalWorkSize[0]));
             mPostGlobalWorkSize[1] = ROUND_UP(mPostGlobalWorkSize[1], std::max((uint32_t)1, mPostLocalWorkSize[1]));
@@ -412,7 +412,7 @@ ErrorCode ConvBufExecution::onResize(const std::vector<Tensor *> &inputs, const 
             
             std::set<std::string> buildOption = mResource->mBuildOptions;
             buildOption.emplace("-DCONV_LOCAL_SIZE=" + std::to_string(local_size));
-            mKernel[0]        = mOpenCLBackend->getOpenCLRuntime()->buildKernel("conv_2d_buf", "conv_2d_1x1_local", buildOption);
+            mKernel[0]        = mOpenCLBackend->getOpenCLRuntime()->buildKernel("conv_2d_buf", "conv_2d_1x1_local", buildOption, mOpenCLBackend->getPrecision());
             uint32_t idx = 0;
             cl_int ret = CL_SUCCESS;
 
@@ -463,7 +463,7 @@ ErrorCode ConvBufExecution::onResize(const std::vector<Tensor *> &inputs, const 
                 if((outputShape.at(2) % itemW[knl_idx]) != 0){
                     buildOption.emplace("-DBLOCK_LEAVE");
                 }
-                kernel[knl_idx]        = mOpenCLBackend->getOpenCLRuntime()->buildKernel("conv_2d_buf", kernelName[knl_idx], buildOption);
+                kernel[knl_idx]        = mOpenCLBackend->getOpenCLRuntime()->buildKernel("conv_2d_buf", kernelName[knl_idx], buildOption, mOpenCLBackend->getPrecision());
                 uint32_t maxWorkGroupSize = static_cast<uint32_t>(mOpenCLBackend->getOpenCLRuntime()->getMaxWorkGroupSize(kernel[knl_idx]));
                 
                 uint32_t idx            = 0;
@@ -487,7 +487,7 @@ ErrorCode ConvBufExecution::onResize(const std::vector<Tensor *> &inputs, const 
                 MNN_CHECK_CL_SUCCESS(ret, "setArg Conv1x1Buf Kernel Select");
 
                 std::pair<std::vector<uint32_t>, int> retTune;
-                retTune = localWS2DDefault(globalWorkSize[knl_idx], maxWorkGroupSize, mOpenCLBackend->getOpenCLRuntime(), kernelName[knl_idx] + info, kernel[knl_idx]);
+                retTune = localWS2DDefault(globalWorkSize[knl_idx], maxWorkGroupSize, mOpenCLBackend->getOpenCLRuntime(), kernelName[knl_idx] + info, kernel[knl_idx], mOpenCLBackend->getCLTuneLevel());
                 if(min_cost.first > retTune.second) {
                     min_cost.first = retTune.second;
                     min_cost.second = knl_idx;
@@ -505,7 +505,7 @@ ErrorCode ConvBufExecution::onResize(const std::vector<Tensor *> &inputs, const 
             if((outputShape.at(2) % itemW[min_index]) != 0){
                 buildOption.emplace("-DBLOCK_LEAVE");
             }
-            mKernel[0]        = mOpenCLBackend->getOpenCLRuntime()->buildKernel("conv_2d_buf", kernelName[min_index], buildOption);
+            mKernel[0]        = mOpenCLBackend->getOpenCLRuntime()->buildKernel("conv_2d_buf", kernelName[min_index], buildOption, mOpenCLBackend->getPrecision());
             uint32_t idx = 0;
             cl_int ret = CL_SUCCESS;
 
@@ -557,9 +557,9 @@ ErrorCode ConvBufExecution::onResize(const std::vector<Tensor *> &inputs, const 
 
         mKernel.resize(conv_block_num);
         
-        std::vector<std::shared_ptr<KernelWrap>> kernel(actual_kernel);
-        std::vector<std::vector<uint32_t>> globalWorkSize(actual_kernel);
-        std::vector<std::vector<uint32_t>> localWorkSize(actual_kernel);
+        std::shared_ptr<KernelWrap> kernel[total_kernel];
+        std::vector<uint32_t> globalWorkSize[total_kernel];
+        std::vector<uint32_t> localWorkSize[total_kernel];
         std::pair<int, int> min_cost(INT_MAX, 0);//(min_time, min_index)
         for(int knl_idx = 0; knl_idx < actual_kernel; knl_idx++) {
             std::set<std::string> buildOption = mResource->mBuildOptions;
@@ -569,7 +569,7 @@ ErrorCode ConvBufExecution::onResize(const std::vector<Tensor *> &inputs, const 
             if((outputShape.at(2) % itemW[knl_idx]) != 0 || (outputShape.at(1) % itemH[knl_idx]) != 0){
                 buildOption.emplace("-DBLOCK_LEAVE");
             }
-            kernel[knl_idx]        = mOpenCLBackend->getOpenCLRuntime()->buildKernel("conv_2d_buf", kernelName[knl_idx], buildOption);
+            kernel[knl_idx]        = mOpenCLBackend->getOpenCLRuntime()->buildKernel("conv_2d_buf", kernelName[knl_idx], buildOption, mOpenCLBackend->getPrecision());
             uint32_t maxWorkGroupSize = static_cast<uint32_t>(mOpenCLBackend->getOpenCLRuntime()->getMaxWorkGroupSize(kernel[knl_idx]));
 
             int each_oc = (UP_DIV(outputShape.at(3), itemC[knl_idx]) + conv_block_num - 1) / conv_block_num;
@@ -600,7 +600,7 @@ ErrorCode ConvBufExecution::onResize(const std::vector<Tensor *> &inputs, const 
             MNN_CHECK_CL_SUCCESS(ret, "setArg ConvBuf Kernel Select");
 
             std::pair<std::vector<uint32_t>, int> retTune;
-            retTune = localWS2DDefault(globalWorkSize[knl_idx], maxWorkGroupSize, mOpenCLBackend->getOpenCLRuntime(), kernelName[knl_idx] + info, kernel[knl_idx]);
+            retTune = localWS2DDefault(globalWorkSize[knl_idx], maxWorkGroupSize, mOpenCLBackend->getOpenCLRuntime(), kernelName[knl_idx] + info, kernel[knl_idx], mOpenCLBackend->getCLTuneLevel());
 
             if(min_cost.first > retTune.second) {
                 min_cost.first = retTune.second;
@@ -620,7 +620,7 @@ ErrorCode ConvBufExecution::onResize(const std::vector<Tensor *> &inputs, const 
         }
         
         for(int kernel_idx = 0; kernel_idx < conv_block_num; kernel_idx++) {
-            mKernel[kernel_idx]        = mOpenCLBackend->getOpenCLRuntime()->buildKernel("conv_2d_buf", kernelName[min_index], buildOption);
+            mKernel[kernel_idx]        = mOpenCLBackend->getOpenCLRuntime()->buildKernel("conv_2d_buf", kernelName[min_index], buildOption, mOpenCLBackend->getPrecision());
             
             uint32_t idx            = 0;
             cl_int ret = CL_SUCCESS;
@@ -675,7 +675,7 @@ ErrorCode ConvBufExecution::onExecute(const std::vector<Tensor *> &inputs, const
         mResource->mRasterExe->onExecute({}, {mResource->mFilter.get()});
         if (inputs.size() > 2) {
             auto buffer_size = inputs[2]->elementSize();
-            if(mOpenCLBackend->getOpenCLRuntime()->isSupportedFP16()) {
+            if(mOpenCLBackend->getPrecision() != BackendConfig::Precision_High) {
                 buffer_size *= sizeof(half_float::half);
             } else {
                 buffer_size *= sizeof(float);
@@ -779,31 +779,7 @@ public:
         std::vector<int> outputShape = tensorShapeFormat(output);
         const int outputChannel         = outputShape.at(3);
         const int inputChannels = inputShape.at(3);
-#ifdef MNN_LOW_MEMORY
-        if (static_cast<OpenCLBackend *>(backend)->getMemory() == BackendConfig::Memory_Low){
-            auto conv2dParams = op->main_as_Convolution2D();
-            if (conv2dParams->quanParameter() != nullptr) {
-                if (((conv2dParams->quanParameter()->type() == 4) ||
-                     (conv2dParams->quanParameter()->type() == 1) ||
-                     (conv2dParams->quanParameter()->type() == 2))) {
-                    if ((1 == conv2dParams->quanParameter()->type() || 2 == conv2dParams->quanParameter()->type()) && conv2dParams->quanParameter()->has_scaleInt()) {
-                        // Don't support IDST-int8 because of error
-                        return nullptr;
-                    }
-                    for (int i = 0; i < inputs.size(); ++i) {
-                        TensorUtils::setTensorSupportPack(inputs[i], false);
-                    }
-                    for (int i = 0; i < outputs.size(); ++i) {
-                        TensorUtils::setTensorSupportPack(outputs[i], false);
-                    }
-                    return new ConvBufLowMemoryExecution(inputs, outputs, op, backend);
-                } else {
-                    //MNN_ERROR("OpenCL Conv buf low memory init error. For Opencl Backend, only support low memory mode of int8 or int4 dequantization currently.\n");
-                    return nullptr;
-                }
-            }
-        }
-#endif
+
         if (nullptr != op->main_as_Convolution2D()->quanParameter()) {
             auto quan = op->main_as_Convolution2D()->quanParameter();
             if (1 == quan->type() || 2 == quan->type()) {
@@ -854,6 +830,33 @@ public:
             return new ConvSubgroupBuf(inputs, outputs, op, backend);
         }
 #endif /* MNN_SUPPORT_INTEL_SUBGROUP */
+        
+#ifdef MNN_LOW_MEMORY
+        if (static_cast<OpenCLBackend *>(backend)->getMemory() == BackendConfig::Memory_Low){
+            auto conv2dParams = op->main_as_Convolution2D();
+            if (conv2dParams->quanParameter() != nullptr) {
+                if (((conv2dParams->quanParameter()->type() == 4) ||
+                     (conv2dParams->quanParameter()->type() == 1) ||
+                     (conv2dParams->quanParameter()->type() == 2))) {
+                    if ((1 == conv2dParams->quanParameter()->type() || 2 == conv2dParams->quanParameter()->type()) && conv2dParams->quanParameter()->has_scaleInt()) {
+                        // Don't support IDST-int8 because of error
+                        return nullptr;
+                    }
+                    for (int i = 0; i < inputs.size(); ++i) {
+                        TensorUtils::setTensorSupportPack(inputs[i], false);
+                    }
+                    for (int i = 0; i < outputs.size(); ++i) {
+                        TensorUtils::setTensorSupportPack(outputs[i], false);
+                    }
+                    return new ConvBufLowMemoryExecution(inputs, outputs, op, backend);
+                } else {
+                    MNN_ERROR("OpenCL Conv buf low memory init error. For Opencl Backend, only support low memory mode of int8 or int4 dequantization currently.\n");
+                    return nullptr;
+                }
+            }
+        }
+#endif
+        
         for (int i = 0; i < inputs.size(); ++i) {
             TensorUtils::setTensorSupportPack(inputs[i], false);
         }

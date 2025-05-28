@@ -25,6 +25,21 @@
 #endif
 
 namespace MNN {
+void CPUConvolution::Resource::copyBias(float* dst, const float* bias, int outputCount, Backend* backend) {
+    auto core = static_cast<CPUBackend*>(backend)->functions();
+    int bytes = core->bytes;
+    int unit = core->pack;
+    auto alignOutput = UP_DIV(outputCount, unit) * unit;
+    int remain = alignOutput - outputCount;
+    if (bytes < 4) {
+        core->MNNFp32ToLowp(bias, (int16_t*)dst, outputCount);
+    } else {
+        ::memcpy(dst, bias, outputCount * bytes);
+    }
+    if (remain > 0) {
+        ::memset((uint8_t*)dst + outputCount * bytes, 0, remain * bytes);
+    }
+}
 
 bool CPUConvolution::Resource::copyBiasAlign(const float* bias, int outputCount) {
     auto core = static_cast<CPUBackend*>(backend)->functions();
@@ -38,17 +53,10 @@ bool CPUConvolution::Resource::copyBiasAlign(const float* bias, int outputCount)
         MNN_ERROR("Error for alloc memory for Alloc Bias\n");
         return false;;
     }
-    if (bytes < 4) {
-        core->MNNFp32ToLowp(bias, mBias->host<int16_t>(), outputCount);
-    } else {
-        ::memcpy(mBias->host<float>(), bias, outputCount * bytes);
-    }
-    if (remain > 0) {
-        ::memset(mBias->host<uint8_t>() + outputCount * bytes, 0, remain * bytes);
-    }
+    copyBias(mBias->host<float>(), bias, outputCount, backend);
     return true;
 }
-CPUConvolution::MutableResourceInt8::MutableResourceInt8(std::shared_ptr<ResourceInt8> res, Backend* backend) : mResource(res) {
+CPUConvolution::MutableResourceInt8::MutableResourceInt8(std::shared_ptr<ResourceInt8> res, Backend* backend, float* scalePtr) : mResource(res) {
     auto outputChannleUp4 = res->mOriginBias->length(0);
     mBiasFloat.reset(Tensor::createDevice<int32_t>({outputChannleUp4}));
     mValid = backend->onAcquireBuffer(mBiasFloat.get(), Backend::STATIC);
@@ -69,7 +77,10 @@ CPUConvolution::MutableResourceInt8::MutableResourceInt8(std::shared_ptr<Resourc
         // bias int32 -> bias float
         auto int32BiasPtr = res->mOriginBias->host<int32_t>();
         auto floatBiasPtr = mBiasFloat->host<float>();
-        auto weightScale  = res->mOriginScale->host<float>();
+        auto weightScale = scalePtr;
+        if (!scalePtr) {
+            weightScale  = res->mOriginScale->host<float>();
+        }
         for (int i = 0; i < outputChannleUp4; ++i) {
             if (mInputScale && mOutputScale) { // symmetric quan
                 floatBiasPtr[i] = int32BiasPtr[i] * weightScale[i] * mInputScale / mOutputScale;
@@ -104,9 +115,6 @@ void CPUConvolution::MutableResourceInt8::updateInputOutputScale(std::vector<flo
     mOutputScale = mResource->mOutputScale;
     mInputZeroPoint = mResource->mInputZeroPoint;
     mOutputZeroPoint = mResource->mOutputZeroPoint;
-//    if (mInputScale == inputScale && mOutputScale == outputScale) {
-//        return;
-//    }
     if (inputScale != 0 && outputScale != 0) {
         mInputScale = inputScale;
         mOutputScale = outputScale;
@@ -117,10 +125,9 @@ void CPUConvolution::MutableResourceInt8::updateInputOutputScale(std::vector<flo
         return;
     }
 
-    const int kernelNum = static_cast<int>(mResource->mInt8WeightKernelSum.size());
+    const int ocUp4 = static_cast<int>(mResource->mWeightKernelSum->length(0) / sizeof(float));
     auto biasData    = mResource->mOriginBias->host<float>();
-    auto alphaData   = mResource->mOriginScale->host<float>();
-    auto alphaScale  = mInputScale / mOutputScale;
+    auto scaleDiv  = mInputScale / mOutputScale;
     auto scale = mScaleFloat->host<float>();
     auto bias = mBiasInt32->host<int32_t>();
     auto biasfloat = mBiasFloat->host<float>();
@@ -129,17 +136,23 @@ void CPUConvolution::MutableResourceInt8::updateInputOutputScale(std::vector<flo
 #else
     float offset = 0.f;
 #endif
-    for (int i = 0; i < kernelNum; i++) {
-        auto alphaValue = alphaData[i];
-        if (fabs(alphaValue) < 1e-6) {
-            alphaValue = 1e-6;
+    if (mResource->mOriginScale) {
+        auto weightScalePtr   = mResource->mOriginScale->host<float>();
+        for (int i = 0; i < ocUp4; i++) {
+            auto weightScale = weightScalePtr[i];
+            if (fabs(weightScale) < 1e-6) {
+                weightScale = 1e-6;
+            }
+            scale[i] = weightScale * scaleDiv; // input_scale*weight_scale/output_scale
+            // compute outputZeroPointFused in asymmetric quant
+            int outputZeroPointFused = static_cast<int32_t>(mOutputZeroPoint / scale[i]);
+            bias[i] = static_cast<int32_t>(biasData[i] / (mInputScale * weightScale)) - mResource->mInt8WeightKernelSum[i] * (mInputZeroPoint + offset) + outputZeroPointFused;
         }
-        scale[i] = alphaValue * alphaScale; // input_scale*weight_scale/output_scale
-        // compute outputZeroPointFused in asymmetric quant
-        int outputZeroPointFused = static_cast<int32_t>(mOutputZeroPoint / scale[i]);
-        bias[i] = static_cast<int32_t>(biasData[i] / (mInputScale * alphaValue)) - mResource->mInt8WeightKernelSum[i] * (mInputZeroPoint + offset) + outputZeroPointFused;
-        // biasfloat[i] = biasData[i] / mOutputScale - mResource->mInt8WeightKernelSum[i] * (mInputZeroPoint + offset) * scale[i] + mOutputZeroPoint;
-        biasfloat[i] = bias[i] * scale[i];
+    } else {
+        for (int i = 0; i < ocUp4; ++i) {
+            biasfloat[i] = (biasData[i] - mResource->mWeightKernelSum->host<float>()[i] * (mInputZeroPoint + offset) * mInputScale) / mOutputScale + mOutputZeroPoint;
+            
+        }
     }
 }
 std::shared_ptr<CPUConvolution::ResourceInt8> CPUConvolution::makeResourceInt8(Backend* backend, const MNN::Op* op, int pack) {
@@ -153,33 +166,22 @@ std::shared_ptr<CPUConvolution::ResourceInt8> CPUConvolution::makeResourceInt8(B
     const auto convCommon  = convParam->common();
     const auto group = convParam->common()->group();
     const auto outputCount = convCommon->outputCount();
-    const auto outputChannleUp4 = UP_DIV(outputCount, UNIT) * UNIT;
+    const auto ocUpUnit = UP_DIV(outputCount, UNIT) * UNIT;
 
-    int quanCount = outputChannleUp4;
-    if (convParam->quanParameter() && convParam->quanParameter()->alpha() && convParam->quanParameter()->buffer()) { // For block quant models.
-        quanCount = convParam->quanParameter()->alpha()->size();
-        quanCount = ROUND_UP(quanCount, UNIT); // If block quant applied, quanCount > outputChannelUp4
-        if (quanCount < outputChannleUp4) {
-            MNN_PRINT("quantCount < outputUp4, check if need.\n");
-            quanCount = outputChannleUp4;
-        }
-    }
-    resource->mOriginBias.reset(Tensor::createDevice<int32_t>({quanCount}));
-    resource->mOriginScale.reset(Tensor::createDevice<uint8_t>({quanCount * core->bytes}));
-    resource->mWeightQuantZero.reset(Tensor::createDevice<int32_t>({quanCount}));
+    resource->mOriginBias.reset(Tensor::createDevice<int32_t>({ocUpUnit}));
+    resource->mOriginScale.reset(Tensor::createDevice<uint8_t>({2 * ocUpUnit * core->bytes}));
+    resource->mWeightKernelSum.reset(Tensor::createDevice<uint8_t>({ocUpUnit * 4}));
     auto allocRes = backend->onAcquireBuffer(resource->mOriginBias.get(), Backend::STATIC);
     allocRes &= backend->onAcquireBuffer(resource->mOriginScale.get(), Backend::STATIC);
-    allocRes &= backend->onAcquireBuffer(resource->mWeightQuantZero.get(), Backend::STATIC);
+    allocRes &= backend->onAcquireBuffer(resource->mWeightKernelSum.get(), Backend::STATIC);
     if (!allocRes) {
         return nullptr;
     }
 
     auto biasPtr = resource->mOriginBias->host<int32_t>();
-    memset(biasPtr, 0, quanCount * sizeof(int32_t));
+    memset(biasPtr, 0, ocUpUnit * sizeof(int32_t));
     auto scalePtr = resource->mOriginScale->host<float>();
-    memset(scalePtr, 0, quanCount * sizeof(uint8_t) * core->bytes);
-    auto betaPtr = resource->mWeightQuantZero->host<int32_t>();
-    memset(betaPtr, 0, quanCount * sizeof(int32_t));
+    memset(scalePtr, 0, ocUpUnit * 2 * sizeof(float));
 
     resource->mActBits = 8;
     if (convParam->symmetricQuan()) {
@@ -188,7 +190,7 @@ std::shared_ptr<CPUConvolution::ResourceInt8> CPUConvolution::makeResourceInt8(B
     const int8_t* weightSrc = nullptr;
     int weightSize = 0;
     std::shared_ptr<ConvolutionCommon::Int8Common> quanCommon;
-    if (!ConvolutionCommon::getConvInt8Parameters(op, quanCommon, backend, weightSrc, weightSize, scalePtr, biasPtr, betaPtr)) {
+    if (!ConvolutionCommon::getConvInt8Parameters(op, quanCommon, backend, weightSrc, weightSize, scalePtr, biasPtr, ocUpUnit)) {
         return nullptr;
     }
     if (convParam->bias() && convParam->quanParameter()->alpha()) {
@@ -206,49 +208,24 @@ std::shared_ptr<CPUConvolution::ResourceInt8> CPUConvolution::makeResourceInt8(B
     }
     const int kernelNum = outputCount;
     const int kernelSize = weightSize / kernelNum;
-    resource->mInt8WeightKernelSum.resize(outputChannleUp4);
-    bool checkWeightQuantZero = false;
+    resource->mInt8WeightKernelSum.resize(ocUpUnit); // for cpu, only used by depthwiseInt8
+    auto weightBiasPtr = scalePtr + ocUpUnit;
     for (int i = 0; i < kernelNum; i++) {
         int temp = 0;
         int offset = i * kernelSize;
-        if (static_cast<int32_t>(betaPtr[i]) != 0) {
-            checkWeightQuantZero = true;
-        }
         for (int j = 0; j < kernelSize; j++) {
-            temp += (static_cast<int>(weightSrc[offset + j]) - betaPtr[i]);
+            temp += static_cast<int>(weightSrc[offset + j]);
         }
-        resource->mInt8WeightKernelSum[i] = temp;
+        resource->mInt8WeightKernelSum[i] = (temp + kernelSize * (weightBiasPtr[i] / scalePtr[i]));
 #ifdef MNN_USE_SSE
         if (resource->mUseConvQuan) {
             resource->mOriginBias->host<int32_t>()[i] -= 128 * temp;
         }
 #endif
     }
-    if (false == checkWeightQuantZero) { // All weight quant bias is 0, do not need to compute related term in gemm kernel.
-        resource->mWeightAsymmetricQuant = false;
-    }
-    resource->mInputZeroPoint = 0;
-    resource->mOutputZeroPoint = 0;
-    resource->mClampMin = -128;
-    resource->mClampMax = 127;
-    if (convParam->symmetricQuan()) {
-        resource->mInputZeroPoint = convParam->symmetricQuan()->zeroPoint();
-        resource->mOutputZeroPoint = convParam->symmetricQuan()->outputZeroPoint();
-        resource->mClampMin = convParam->symmetricQuan()->clampMin();
-        resource->mClampMax = convParam->symmetricQuan()->clampMax();
-    }
-    if (convParam->quanParameter() != nullptr) {
-        resource->mInputScale = convParam->quanParameter()->scaleIn();
-        resource->mOutputScale = convParam->quanParameter()->scaleOut();
-    }
+    ConvInt8TiledExecutor::initializeConvInt8QuantInfo(resource, convParam);
     auto weightDst = resource->mWeightInt8->host<int8_t>();
-    // TODO(yanxing): don't copy!
     memcpy(weightDst, weightSrc, resource->mWeightInt8->size());
-    resource->mRelu = convCommon->relu() || convCommon->relu6();
-    if (convParam->symmetricQuan() && convParam->symmetricQuan()->outputDataType() == MNN::DataType_DT_FLOAT) {
-        resource->mOutputZeroPoint = 0;
-        resource->mOutputScale = 1.0f;
-    }
     return resource;
 }
 
@@ -304,16 +281,28 @@ public:
         return OneDNNConvInt8::create(backend, convOp, inputs, outputs);
 #endif
         auto core = static_cast<CPUBackend*>(backend)->functions();
-        auto res = CPUConvolution::makeResourceInt8(backend, op, core->pack);
+        
 #ifdef MNN_USE_SPARSE_COMPUTE
         if (static_cast<CPUBackend*>(backend)->functions()->pack == 4 && convOp->sparseParameter() && SparseConvInt8TiledExecutor::shouldUseSparse(convOp)) {
+            auto res = CPUConvolution::makeResourceInt8(backend, op, core->pack);
             return new SparseConvInt8TiledExecutor(backend, op, res);
         }
 #endif
+#ifndef MNN_REDUCE_SIZE
         if (ConvInt8Winograd::mustUse(convOp)) {
+            auto res = CPUConvolution::makeResourceInt8(backend, op, core->pack);
             return new ConvInt8Winograd(backend, convOp, res);
         }
-        return new DenseConvInt8TiledExecutor(backend, op, res);
+#endif
+        std::shared_ptr<ConvolutionCommon::Int8Common> quanCommon;
+        if (convOp->quanParameter() && (convOp->quanParameter()->buffer() || convOp->external())) { // int8 weight
+            quanCommon = ConvolutionCommon::load(op, backend, false, true);
+            
+        }
+        // auto res = CPUConvolution::makeResourceInt8(backend, op, core->pack);
+        // return new DenseConvInt8TiledExecutor(backend, op, res);
+        
+       return new DenseConvInt8TiledExecutor(backend, op, quanCommon, false);
     }
 };
 

@@ -100,7 +100,6 @@ Tokenizer* Tokenizer::createTokenizer(const std::string& filename) {
         return tokenizer;
     }
     line_str >> tokenizer_type;
-    printf("tokenizer_type = %d\n", tokenizer_type);
     // create tokenizer
     switch (tokenizer_type)
     {
@@ -475,7 +474,7 @@ void Tiktoken::encode(const std::string& str, std::vector<int>& ids) {
         } else {
             // If no matching symbol is found, this typically means an error in the encoding
             // or the input text contains characters that the encoder doesn't know how to handle
-            std::cerr << "Error: No encoding found for the sequence starting at position " << i << std::endl;
+            std::cerr << "Error: No encoding found for the sequence starting at position " << i << " , symbol: " << str[i-2] << std::endl;
             return;
         }
     }
@@ -711,11 +710,17 @@ void HuggingfaceTokenizer::bpe(const std::wstring& token, const BPERanks& bpe_ra
 }
 
 void HuggingfaceTokenizer::encode(const std::string& str, std::vector<int>& ids) {
-    std::regex re("('s|'t|'re|'ve|'m|'ll|'d| ?[[:alpha:]]+| ?[[:digit:]]+| ?[^\\s\\w]+|\\s+)");
+    /* original regex from tokenizer.json
+        "(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\\r\\n\\p{L}\\p{N}]?\\p{L}+|\\p{N}| ?[^\\s\\p{L}\\p{N}]+[\\r\\n]*|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+"
+     //    std::regex re("('s|'t|'re|'ve|'m|'ll|'d| ?[[:alpha:]]+| ?[[:digit:]]+| ?[^\\s\\w]+|\\s+)");
+     */
+    std::regex re("('s|'t|'re|'ve|'m|'ll|'d)|[^\\r\\n[:alpha:][:digit:]]?[[:alpha:]]+|[[:digit:]]| ?[^\\s[:alpha:][:digit:]]+[\r\n]*|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+", std::regex_constants::icase);
+    
     std::string input = str;
     std::vector<std::string> result;
-    std::string token;
     std::smatch match;
+    
+    std::string token;
     while (std::regex_search(input, match, re)) {
         token = match.str(0);
         input = match.suffix().str();

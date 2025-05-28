@@ -65,6 +65,8 @@ public:
     typedef std::map<std::pair<Tensor::InsideDescribe::NativeInsideDescribe*, Backend*>, std::pair<std::weak_ptr<Tensor::InsideDescribe::NativeInsideDescribe>, std::shared_ptr<Tensor>>> WrapTensorCache;
 private:
     ErrorCode _allocForTensor(int index, bool allocInput);
+    ErrorCode _enterExecute();
+    void _exitExecute();
     void _copyInputs();
     void _pushTuningTask(std::vector<Schedule::OpCacheInfo>&& initInfos);
     void _recycleDynamicMemory(Command* command);
@@ -78,7 +80,7 @@ private:
     // For gpu or other backend
     std::map<Tensor*, std::shared_ptr<Tensor>> mCacheConstTensors;
     WrapTensorCache mWrapTensors;
-#ifndef MNN_BUILD_MINI
+#ifndef MNN_SKIPBUILD_GEOMETRY
     GeometryComputer::Context mContext;
     Runtime::CompilerType mUseGeometry;
     bool mGeometryNeedRelease = true;

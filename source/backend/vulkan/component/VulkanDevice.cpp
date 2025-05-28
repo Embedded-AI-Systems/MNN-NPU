@@ -10,6 +10,20 @@
 #include <string.h>
 //#define MNN_VULKAN_PRINT_EXT
 namespace MNN {
+static uint32_t _getLocalMemorySize(const VkPhysicalDeviceMemoryProperties& memProty) {
+    int32_t localMemorySize = 0;
+    for (int i=0; i<VK_MAX_MEMORY_TYPES; ++i) {
+        auto& heap = memProty.memoryHeaps[i];
+        if (heap.flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) {
+            auto size = (int32_t)heap.size;
+            if (size > 0) {
+                localMemorySize = size;
+            }
+            break;
+        }
+    }
+    return localMemorySize;
+}
 VulkanDevice::VulkanDevice(std::shared_ptr<VulkanInstance> instance)
     : mOwner(true),
       mInstance(instance),
@@ -105,6 +119,20 @@ VulkanDevice::VulkanDevice(std::shared_ptr<VulkanInstance> instance)
     vkGetPhysicalDeviceProperties(mPhysicalDevice, &mDeviceProty);
     vkGetPhysicalDeviceMemoryProperties(mPhysicalDevice, &mMemoryProty);
     getDeviceQueue(mQueueFamilyIndex, 0, mQueue);
+
+    // query subgroupSize
+    {
+        VkPhysicalDeviceProperties2 deviceProperties2 = {};
+        deviceProperties2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2;
+
+        VkPhysicalDeviceSubgroupProperties subgroupProperties = {};
+        subgroupProperties.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_PROPERTIES;
+
+        deviceProperties2.pNext = &subgroupProperties;
+        vkGetPhysicalDeviceProperties2(mPhysicalDevice, &deviceProperties2);
+        mSubgroupSize = subgroupProperties.subgroupSize;
+    }
+    mLocalMemorySize = _getLocalMemorySize(mMemoryProty);
 #ifdef MNN_VULKAN_PRINT_EXT
     uint32_t pPropertyCount;
     vkEnumerateInstanceExtensionProperties(nullptr, &pPropertyCount, nullptr);
@@ -129,8 +157,9 @@ VulkanDevice::VulkanDevice(std::shared_ptr<VulkanInstance> instance, VkPhysicalD
       mPhysicalDevice(physicalDevice),
       mDevice(device),
       mQueue(queue) {
-    vkGetPhysicalDeviceProperties(mPhysicalDevice, &mDeviceProty);
-    vkGetPhysicalDeviceMemoryProperties(mPhysicalDevice, &mMemoryProty);
+      vkGetPhysicalDeviceProperties(mPhysicalDevice, &mDeviceProty);
+      vkGetPhysicalDeviceMemoryProperties(mPhysicalDevice, &mMemoryProty);
+      mLocalMemorySize = _getLocalMemorySize(mMemoryProty);
 }
 
 VulkanDevice::~VulkanDevice() {

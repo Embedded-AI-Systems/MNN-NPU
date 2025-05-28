@@ -22,6 +22,7 @@
 #endif
 
 namespace MNN {
+class WorkerThread;
 class CPURuntime : public Runtime {
 public:
     struct DynamicAllocator {
@@ -40,8 +41,8 @@ public:
     virtual CompilerType onGetCompilerType() const override {
         return Compiler_Loop;
     }
-    void onConcurrencyBegin() const;
-    void onConcurrencyEnd() const;
+    virtual void onConcurrencyBegin() const override;
+    virtual void onConcurrencyEnd() const override;
     virtual bool onCheckInfo(Backend::Info& info) const override;
 
 #ifdef MNN_USE_THREAD_POOL
@@ -59,7 +60,7 @@ private:
     int mThreadNumber;
 #ifdef MNN_USE_THREAD_POOL
     mutable int mTaskIndex = -1;
-    mutable bool mThreadOpen = false;
+    mutable int mThreadOpen = 0;
 #endif
     BackendConfig::MemoryMode mMemory;
     BackendConfig::PowerMode mPower;
@@ -73,7 +74,8 @@ private:
     mutable std::vector<SingleBufferWithAllocator> mDynamic;
     mutable std::vector<SingleBufferWithAllocator> mDynamicMmap;
     mutable std::shared_ptr<DynamicAllocator> mSharedDmaInfo;
-    mutable std::shared_ptr<EagerBufferAllocator> mStaticAllocatorCache;
+    mutable std::shared_ptr<EagerBufferAllocator> mStaticAllocatorRaw;
+    mutable std::shared_ptr<EagerBufferAllocator> mStaticAllocatorMMap;
 };
 struct CoreFunctions;
 struct CoreInt8Functions;
@@ -100,7 +102,7 @@ private:
 };
 class CPUBackend : public Backend {
 public:
-    CPUBackend(const CPURuntime* runtime, BackendConfig::PrecisionMode precision, BackendConfig::MemoryMode memory, MNNForwardType type = MNN_FORWARD_CPU, size_t flags = 0);
+    CPUBackend(const CPURuntime* runtime, BackendConfig::PrecisionMode precision, BackendConfig::MemoryMode memory, MNNForwardType type = MNN_FORWARD_CPU, size_t flags = 0, int initThreadNumber = 0);
     virtual ~CPUBackend();
 
     // Return sizeDivide, scheduleNumber aligned memory
@@ -149,7 +151,7 @@ public:
     }
 #ifdef MNN_USE_THREAD_POOL
     inline bool threadOpen() const {
-        return mRuntime->mThreadOpen;
+        return mRuntime->mThreadOpen > 0;
     }
 #endif
 
@@ -176,18 +178,19 @@ public:
     static int getBytes(const Backend* backend, const Tensor* output);
     static DataType getDataType(const Tensor* tensor);
     friend class CPURuntime;
+    void enqueueTask(std::function<int()>&& task);
 
 protected:
     MemObj* allocBuffer(size_t size, Tensor* dest,  StorageType storageType);
     CoreFunctions* mCoreFunctions;
     CoreInt8Functions* mInt8CoreFunctions;
 private:
+    mutable std::shared_ptr<WorkerThread> mInitWorkQueue;
     int mThreadNumber;
     std::vector<std::pair<float, int>> mGroupWithComputeRate;
     float mComputeI = 0.f;
 
     std::shared_ptr<CPURuntime::DynamicAllocator> mDmaInfo;
-    std::shared_ptr<EagerBufferAllocator> mStaticAllocator;
     CPURuntime* mRuntime;
     BackendConfig::PrecisionMode mPrecisionMode;
     BackendConfig::MemoryMode mMemory;
@@ -236,9 +239,6 @@ private:
         static name _temp;\
         CPUBackend::addCreator(opType, &_temp); \
     }
-
-#define REGISTER_CPU_OP_CREATOR_AUDIO(name, opType) \
-    REGISTER_CPU_OP_CREATOR(name, opType)
 
 } // namespace MNN
 

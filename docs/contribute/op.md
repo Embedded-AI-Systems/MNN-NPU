@@ -70,7 +70,6 @@ table MyCustomOpParam {
 目前，MNN支持TensorFlow、TensorFlow Lite、Caffe、ONNX和TorchScript模型格式的转换。
 
 ### TensorFlow模型转换
-1. 添加转换类
 在`tools/converter/source/tensorflow`下添加`MyCustomOpTf.cpp`。可以直接声明转换类，也可以利用宏定义简化代码。
 
 直接声明示例：
@@ -96,16 +95,6 @@ DECLARE_OP_CONVERTER(MyCustomOpTf);
 ```cpp
 REGISTER_CONVERTER(MyCustomOpTf, MyCustomOp);
 ```
-
-2. 添加映射
-在`OpMapper.hpp`中添加相应的TensorFlow Op名字到MNN Op名字的映射：
-```cpp
-{"OpName1", MNN::OpType_MyCustomOp},
-{"OpName2", MNN::OpType_MyCustomOp},
-```
-
-3. 处理Op附带的Const
-如果Const不作为此Op的参数，而是看成一个单独的Op，可以忽略此步骤；如果Op要把Const当成参数，要在文件`TmpGraph.cpp`里修改函数`_genMinGraph()`，把相应Const节点的`isCovered`属性设置为true。
 
 ### TensorFlow Lite模型转换
 1. 添加转换类
@@ -422,10 +411,23 @@ private:
 ```
 
 3. 实现
-实现函数`onResize`(可选)、`onExecute`。执行完毕返回NO_ERROR。
+实现函数`onResize`(可选)、`onExecute`。执行完毕返回`NO_ERROR`。
 
 4. 注册实现类-
 ```cpp
 GLCreatorRegister<TypedCreator<GLMyCustomOp>> __my_custom_op(OpType_MyCustomOp);
 ```
 
+### 添加QNN实现
+QNN后端通过调用高通QNN的官方算子库（qti.aisw）实现MNN的计算功能。为QNN添加算子时，开发者需要充分理解MNN的算子格式与QNN的算子格式，读取MNN算子的尺寸与参数，设定QNN算子的尺寸与参数。
+关于QNN的官方算子库，开发者可以参考[官方文档的算子定义](https://docs.qualcomm.com/bundle/publicresource/topics/80-63442-50/MasterOpDef.html?product=1601111740009302)，以及[算子在HTP上的限制](https://docs.qualcomm.com/bundle/publicresource/topics/80-63442-50/HtpOpDefSupplement.html)。
+
+1、添加Executor
+- 在`source/backend/qnn/execution`目录下，添加`QnnCustomOp.cpp`与`QnnCustomOp.hpp`，实现`QnnCustomOp`类以及`QnnCustomOpCreator`类的骨架代码。
+- 实现`QnnCustomOp::onEncode`函数，有两种情况
+  - 使用单个QNN算子就可以实现MNN算子的计算功能。对于单个QNN算子，一般包含添加inputs，添加scalar params（可参考`source/backend/qnn/execution/QNNArgmax.cpp`），添加tensor params（可参考`source/backend/qnn/execution/QNNPool.cpp`），添加outputs，调用QNN的节点入图API等步骤。
+  - 拼接多个QNN算子以MNN算子的计算功能。可参考`source/backend/qnn/execution/QNNScale.cpp`。
+
+2、注册算子
+- 在`QnnCustomOp.cpp`中添加注册代码`REGISTER_QNN_OP_CREATOR(QnnCustomOpCreator, OpType_CustomOp)`。
+- 在`source/backend/qnn/backend/QNNUtils.hpp`中添加函数声明`extern void ___QnnCustomOpCreator__OpType_CustomOp__();`；并在`source/backend/qnn/backend/QNNUtils.cpp`内，在函数`registerQNNOps`中追加`___QnnCustomOpCreator__OpType_CustomOp__();`。

@@ -57,6 +57,7 @@ struct RuntimeHint {
 
     // op encoder number for once commit
     int encorderNumForCommit = 10;
+    int initThreadNumber = 0;
 };
 /** abstract backend */
 class Backend : public NonCopyable {
@@ -345,8 +346,17 @@ public:
     void setAsyncWork(std::future<int>&& future);
     MNN_PUBLIC void waitAsyncWork();
 
+    virtual void onConcurrencyBegin() const {
+        // Do nothing
+    }
+    virtual void onConcurrencyEnd() const {
+        // Do nothing
+    }
+
+    mutable int pCurrentStatus = 0; // NO_ERROR
+
     // TODO: Move to Backend
-    void* pMeta;
+    void* pMeta = nullptr;
 private:
     std::future<int> mFuture;
     RuntimeHint mHint;

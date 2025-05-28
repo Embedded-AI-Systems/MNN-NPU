@@ -6,6 +6,8 @@
 //  Copyright © 2018, Alibaba Group Holding Limited
 //
 
+#ifndef MNN_REDUCE_SIZE
+
 #include "StrassenMatmulComputor.hpp"
 #include "DenseConvolutionTiledExecutor.hpp"
 #include "CommonOptFunction.h"
@@ -42,17 +44,11 @@ private:
     BufferAllocator* mAllocator;
 };
 
-StrassenMatrixComputor::StrassenMatrixComputor(Backend* bn, bool multithread, int maxDepth, uint8_t* dequantAlpha, uint8_t* dequantBias, int32_t dequantBits) : mBackend(bn) {
+StrassenMatrixComputor::StrassenMatrixComputor(Backend* bn, bool multithread, int maxDepth) : mBackend(bn) {
     mMaxDepth = maxDepth;
     mSupportMultiThread = multithread;
-    mDequantBias = dequantBias;
-    mDequantAlpha = dequantAlpha;
-    mDequantBits = dequantBits;
     auto core = static_cast<CPUBackend*>(backend())->functions();
     mWeightBytes = core->bytes;
-    if (mDequantBits == 8 || mDequantBits == 4) {
-        mWeightBytes = (float)mDequantBits / 8;
-    }
 };
 StrassenMatrixComputor::~StrassenMatrixComputor() {
     // Do nothing
@@ -81,18 +77,8 @@ ErrorCode StrassenMatrixComputor::_generateTrivalMatMul(int e, int l, int h, con
     auto eReal = aStride / core->bytes / core->pack;
     auto matmulUnit = core->MNNPackedMatMul;
     auto matmulRemain = core->MNNPackedMatMulRemain;
-    const float* dequantAlpha = nullptr;
-    const float* dequantBias  = nullptr;
-    float weightBytes           = 1;
-#ifdef MNN_LOW_MEMORY
-    if (nullptr != mDequantAlpha && nullptr != mDequantBias) {
-        dequantAlpha = reinterpret_cast<const float*>(mDequantAlpha);
-        dequantBias = reinterpret_cast<const float*>(mDequantBias);
-        DenseConvolutionTiledExecutor::selectLowMemoryMatmulFunc(&matmulUnit, &matmulRemain, &weightBytes, mDequantBits, core);
-    }
-#endif
     mFunctions.emplace_back(
-        std::make_pair([cStride, l, h, xCount, AT, BT, CT, COT, tileBufferBasic, unitNumber, bExtraStride, numberThread, eReal, eP, active, matmulUnit, matmulRemain, dequantAlpha, dequantBias, this](int tId) {
+        std::make_pair([cStride, l, h, xCount, AT, BT, CT, COT, tileBufferBasic, unitNumber, bExtraStride, numberThread, eReal, eP, active, matmulUnit, matmulRemain, this](int tId) {
             auto core = static_cast<CPUBackend*>(backend())->functions();
             size_t parameters[7];
             parameters[0] = xCount * core->bytes;
@@ -129,7 +115,7 @@ ErrorCode StrassenMatrixComputor::_generateTrivalMatMul(int e, int l, int h, con
                 int xStart    = i * eP;
                 auto aStart   = aHost + xStart * packUnit;
                 core->MNNPackC4ForMatMul_A((float*)(tileHost), (const float**)(&aStart), info, stride);
-                matmulUnit((float*)(cHost + xStart * packUnit), (float*)tileHost, (float*)bHost, parameters, postParametersPtr, (const float*)biasPtr, dequantAlpha, dequantBias);
+                matmulUnit((float*)(cHost + xStart * packUnit), (float*)tileHost, (float*)bHost, parameters, postParametersPtr, (const float*)biasPtr, nullptr, nullptr);
             }
             if (tId != numberThread -1) {
                 return;
@@ -143,7 +129,7 @@ ErrorCode StrassenMatrixComputor::_generateTrivalMatMul(int e, int l, int h, con
                 auto aStart   = aHost + xStart * packUnit;
                 // Copy
                 core->MNNPackC4ForMatMul_A((float*)(tileHost), (const float**)(&aStart), info, stride);
-                matmulRemain((float*)(cHost + xStart * packUnit), (float*)tileHost, (float*)bHost, xCount, parameters, postParametersPtr, (const float*)biasPtr, dequantAlpha, dequantBias);
+                matmulRemain((float*)(cHost + xStart * packUnit), (float*)tileHost, (float*)bHost, xCount, parameters, postParametersPtr, (const float*)biasPtr, nullptr, nullptr);
             }
         }, numberThread));
     static_cast<CPUBackend*>(backend())->getBufferAllocator()->free(tileBufferBasic);
@@ -502,9 +488,6 @@ void StrassenMatrixComputor::onReset() {
 ErrorCode StrassenMatrixComputor::onEncode(const std::vector<Tensor*>& inputs, const std::vector<Tensor*>& outputs, const std::vector<float>& postParameters, int inputL, int inputH) {
     auto core = static_cast<CPUBackend*>(backend())->functions();
     mWeightBytes = core->bytes;
-    if (mDequantBits == 8 || mDequantBits == 4) {
-        mWeightBytes = (float)mDequantBits / 8;
-    }
     MNN_ASSERT(inputs.size() == 2 || inputs.size() == 3);
     MNN_ASSERT(outputs.size() == 1);
     auto A  = inputs[0];
@@ -581,3 +564,4 @@ void StrassenMatrixComputor::onExecute(const uint8_t* AT, const uint8_t* BT, con
     }
 }
 } // namespace MNN
+#endif

@@ -684,57 +684,7 @@ VARP _Clone(VARP source, bool deepCopy) {
     }
     return inputVar;
 }
-VARP _Conv2DBackPropFilter(VARP input, VARP inputGrad, INTS kernelSize, PaddingMode pad, INTS stride, INTS dilate,
-                           int group, INTS pads) {
-    std::unique_ptr<OpT> convOp(new OpT);
-    convOp->type       = OpType_Conv2DBackPropFilter;
-    auto srcShape = input->getInfo();
-    auto dstShape = inputGrad->getInfo();
-    auto channel       = std::vector<int>{srcShape->dim[1], dstShape->dim[1]};
-    convOp->main.type  = OpParameter_Convolution2D;
-    convOp->main.value = new Convolution2DT;
-    auto conv2D        = convOp->main.AsConvolution2D();
-    conv2D->common.reset(new Convolution2DCommonT);
-    conv2D->common->padX        = pads[0];
-    conv2D->common->padY        = pads[1];
-    conv2D->common->padMode     = _convertPadMode(pad);
-    conv2D->common->strideX     = stride[0];
-    conv2D->common->strideY     = stride[1];
-    conv2D->common->group       = group;
-    conv2D->common->outputCount = channel[1];
-    conv2D->common->inputCount  = channel[0];
-    conv2D->common->dilateX     = dilate[0];
-    conv2D->common->dilateY     = dilate[1];
-    conv2D->common->kernelX     = kernelSize[0];
-    conv2D->common->kernelY     = kernelSize[1];
-    INTS weightDims             = {channel[1], channel[0] / group, kernelSize[1], kernelSize[0]};
 
-    return Variable::create(Expr::create(std::move(convOp), {input, inputGrad}));
-}
-
-VARP _PoolGrad(VARP originInput, VARP originOutput, VARP inputGrad, INTS kernel, INTS stride, PoolingMode type,
-               PaddingMode pad, INTS pads) {
-    std::unique_ptr<OpT> pool(new OpT);
-    pool->type       = OpType_PoolGrad;
-    pool->main.type  = OpParameter_Pool;
-    pool->main.value = new PoolT;
-    if (kernel[0] == -1 && kernel[1] == -1) {
-        pool->main.AsPool()->isGlobal = true;
-    }
-    pool->main.AsPool()->padX = 0;
-    pool->main.AsPool()->padY = 0;
-    if (pads.size() >= 2) {
-        pool->main.AsPool()->padX = pads[0];
-        pool->main.AsPool()->padY = pads[1];
-    }
-    pool->main.AsPool()->padType = _convertPoollingPadMode(pad);
-    pool->main.AsPool()->kernelX = kernel[0];
-    pool->main.AsPool()->kernelY = kernel[1];
-    pool->main.AsPool()->strideX = stride[0];
-    pool->main.AsPool()->strideY = stride[1];
-    pool->main.AsPool()->type    = (PoolType)type;
-    return (Variable::create(Expr::create(std::move(pool), {originInput, originOutput, inputGrad})));
-}
 /*Crop images.
 Args:
 images: 4-D variable of NC4HW4 format.
@@ -1878,8 +1828,13 @@ VARP _Im2Col(VARP x, INTS kernelSize, INTS dilate, INTS pads, INTS stride) {
     auto common    = new Convolution2DCommonT;
     param->common.reset(common);
     op->main.value = param;
-    common->padX        = pads[0];
-    common->padY        = pads[1];
+    if (pads.size() >= 4) {
+        common->pads = pads;
+    } else {
+        // Compability for old model
+        common->padX = pads[0];
+        common->padY = pads[1];
+    }
     common->strideX     = stride[0];
     common->strideY     = stride[1];
     common->dilateX     = dilate[0];
@@ -1897,8 +1852,12 @@ VARP _Col2Im(VARP x, VARP outputShape, INTS kernelSize, INTS dilate, INTS pads, 
     auto common    = new Convolution2DCommonT;
     param->common.reset(common);
     op->main.value = param;
-    common->padX        = pads[0];
-    common->padY        = pads[1];
+    if (pads.size() == 4) {
+        common->pads = pads;
+    } else {
+        common->padX        = pads[0];
+        common->padY        = pads[1];
+    }
     common->strideX     = stride[0];
     common->strideY     = stride[1];
     common->dilateX     = dilate[0];
@@ -2029,9 +1988,27 @@ VARP _ROIAlign(VARP input, VARP roi, int pooledHeight, int pooledWidth, float sp
         return nullptr;
     }
     auto bI = _Split(roi, {1, 4}, 1);
-    auto info0 = bI[0]->getInfo();
-    auto ptr0 = bI[0]->readMap<float>();
     return (Variable::create(Expr::create(op.get(), {input, bI[1], _Cast<int>(bI[0]), backwardDiff})));
+}
+
+VARPS _JSONOp(VARPS x, const char* opDescribe, int outputNumber) {
+    std::unique_ptr<MNN::OpT> op(new MNN::OpT);
+    op->type = OpType_Extra;
+    op->main.type = OpParameter_Extra;
+    op->main.value = new ExtraT;
+    auto extra = op->main.AsExtra();
+    extra->type = "JSON";
+    extra->engine = "MNN";
+    extra->attr.resize(1);
+    extra->attr[0].reset(new AttributeT);
+    extra->attr[0]->s = opDescribe;
+    extra->attr[0]->key = "main";
+    auto expr = Expr::create(op.get(), x, outputNumber);
+    VARPS outputs(outputNumber);
+    for (int i=0; i<outputNumber; ++i) {
+        outputs[i] = Variable::create(expr, i);
+    }
+    return outputs;
 }
 
 } // namespace Express

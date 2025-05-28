@@ -91,7 +91,7 @@ std::pair<size_t, std::pair<size_t, size_t>> ConvolutionTiledExecutor::computeBl
     return std::make_pair(total, std::make_pair(stride, kernelSize * maxLine));
 }
 
-void ConvolutionTiledExecutor:: setIm2ColParameter(ConvolutionCommon::Im2ColParameter& dstIm2ColParamter, const Convolution2DCommon* convCommon, Tensor* input, Tensor* output, int padX, int padY, const CoreFunctions* floatCore, const CoreInt8Functions* int8Core, int pack) {
+void ConvolutionTiledExecutor:: setIm2ColParameter(ConvolutionCommon::Im2ColParameter& dstIm2ColParamter, const Convolution2DCommon* convCommon, Tensor* input, Tensor* output, int padX, int padY, const CoreFunctions* floatCore, const CoreInt8Functions* int8Core, int pack, int32_t* int8GemmUnit) {
     // FIXME: Set int8 and float's pack as diff
     if (pack == 0) {
         pack = floatCore->pack;
@@ -117,19 +117,25 @@ void ConvolutionTiledExecutor:: setIm2ColParameter(ConvolutionCommon::Im2ColPara
     dstIm2ColParamter.srcYStep = input->stride(2) * pack;
     dstIm2ColParamter.packCUnit = pack;
     dstIm2ColParamter.ic = input->channel();
+    dstIm2ColParamter.icup4 = input->channel(); // for float im2col.
     if (nullptr != int8Core) {
         // Compute Int8 Info and align ic
         int UNIT, SRC_UNIT, DynamicDestUnit;
-        auto core = int8Core;
-        core->MNNGetGemmUnit(&UNIT, &SRC_UNIT, &DynamicDestUnit);
-        if (SRC_UNIT > pack) {
-            const auto srcCountUnit = UP_DIV(input->channel(), pack);
-            dstIm2ColParamter.kernelCountUnit = UP_DIV(srcCountUnit * kernelCount, SRC_UNIT / pack);
-            dstIm2ColParamter.ic = dstIm2ColParamter.icDiv4 * pack;
+        if (int8GemmUnit == nullptr) {
+            int8Core->MNNGetGemmUnit(&UNIT, &SRC_UNIT, &DynamicDestUnit);
         } else {
-            const auto srcCountUnit = UP_DIV(input->channel(), SRC_UNIT);
-            dstIm2ColParamter.kernelCountUnit = srcCountUnit * kernelCount;
-            dstIm2ColParamter.ic = srcCountUnit * SRC_UNIT;
+            UNIT = int8GemmUnit[0];
+            SRC_UNIT = int8GemmUnit[1];
+            DynamicDestUnit = int8GemmUnit[2];
+        }
+        const auto srcCountUnit = UP_DIV(input->channel(), SRC_UNIT);
+        dstIm2ColParamter.kernelCountUnit = srcCountUnit * kernelCount;
+        dstIm2ColParamter.ic = srcCountUnit * SRC_UNIT;
+        
+        if (SRC_UNIT > pack) { // Carefully change it.
+            dstIm2ColParamter.icup4 = ROUND_UP(input->channel(), pack);
+        } else {
+            dstIm2ColParamter.icup4 = ROUND_UP(input->channel(), SRC_UNIT);
         }
     }
     if (dstIm2ColParamter.iw == 1 && dstIm2ColParamter.ow == 1 && dstIm2ColParamter.oh > 1 && dstIm2ColParamter.kernelX == 1 && dstIm2ColParamter.padX == 0) {
@@ -188,7 +194,7 @@ std::pair<int, bool> ConvolutionTiledExecutor::turnIm2ColToBlitInfo(float const 
                     auto srcKx   = srcKy + ((oxBegin + sta) * p.strideX + p.dilateX * kx - p.padX) * bytes * unit;
                     srcPtr[number]     = (const float*)srcKx;
                     el[4 * number + 0] = end - sta;
-                    el[4 * number + 1] = p.ic;
+                    el[4 * number + 1] = p.icup4;
                     el[4 * number + 2] = eStart + sta;
                     el[4 * number + 3] = lOffset;
                     number++;

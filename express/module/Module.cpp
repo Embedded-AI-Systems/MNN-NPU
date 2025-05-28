@@ -9,13 +9,14 @@
 #include <MNN/expr/Module.hpp>
 #include <MNN/expr/ExprCreator.hpp>
 #include <MNN/expr/ExecutorScope.hpp>
+#include "core/OpCommonUtils.hpp"
 #include "PipelineModule.hpp"
 #include "core/FileLoader.hpp"
 #include "backend/cpu/CPUBackend.hpp"
 #include "MNN_generated.h"
 #include "Utils.hpp"
 #include "RuntimeAttr.hpp"
-
+#include "ModuleInside.hpp"
 #include <MNN/AutoTime.hpp>
 #ifdef MNN_INTERNAL_ENABLED
 #include "internal/auth/ModelAuth.hpp"
@@ -176,7 +177,7 @@ public:
             int mode = 1;
             if (info->runTimeManager.get() != nullptr) {
                 auto attr = info->runTimeManager->getInside();
-                mode = attr->mNumberThread;
+                mode = attr->mContent->mNumberThread;
                 int backendTypes[MNN_FORWARD_ALL];
                 info->runTimeManager->getInfo(Interpreter::BACKENDS, &backendTypes);
                 backend = backendTypes[0];
@@ -208,13 +209,20 @@ public:
 
     virtual std::vector<Express::VARP> onForward(const std::vector<Express::VARP>& inputs) override {
         auto mModule = mChildren[0];
-
+        // Reset resize staus
+        mInfo->runTimeManager->getInside()->mResizeStatus = 0;
 #ifdef MNN_INTERNAL_ENABLED
         Timer _time;
         auto glo = ExecutorScope::Current();
         glo->getDebugTools()->flops = 0.0f;
 #endif
+        for (auto& iter : mInfo->runTimeManager->getInside()->mRuntime.first) {
+            iter.second->onConcurrencyBegin();
+        }
         auto outputs = mModule->onForward(inputs);
+        for (auto& iter : mInfo->runTimeManager->getInside()->mRuntime.first) {
+            iter.second->onConcurrencyEnd();
+        }
 #ifdef MNN_INTERNAL_ENABLED
         do {
             if (outputs.empty()) {
@@ -246,9 +254,18 @@ public:
     }
     virtual Module* clone(CloneContext* ctx) const override {
         auto mModule = mChildren[0];
+        auto origin = mInfo->runTimeManager->getInside();
+        ScheduleConfig config;
+        config.type = origin->mRuntime.first.begin()->first;
+        config.numThread = origin->mContent->mNumberThread;
+        std::shared_ptr<Executor::RuntimeManager> newRt (Executor::RuntimeManager::createRuntimeManager(config));
+        const_cast<RuntimeAttr*>(newRt->getInside())->mContent = origin->mContent;
+        std::shared_ptr<Module::Info> newInfo(new Module::Info);
+        *newInfo = *mInfo;
+        ctx->pRuntimeManager = newRt;
+        newInfo->runTimeManager = newRt;
         std::shared_ptr<Module> submodule(mModule->clone(ctx));
-
-        NetModule* module(new NetModule(submodule, mInfo, nullptr, 0, 0.0f));
+        NetModule* module(new NetModule(submodule, newInfo, nullptr, 0, 0.0f));
 #ifdef MNN_INTERNAL_ENABLED
         module->mLogInfo = mLogInfo;
 #endif
@@ -333,7 +350,7 @@ Module* Module::load(const std::vector<std::string>& inputs, const std::vector<s
         rtMgr.reset(_createDefaultRuntimeManager(config));
     }
     bool needReset = false;
-    if (rtMgr->getInside()->mExternalFile.empty()) {
+    if (rtMgr->getInside()->mContent->mExternalFile.empty()) {
         // Set Default externalFile
         rtMgr->setExternalFile(std::string(fileName) + ".weight");
         needReset = true;
@@ -361,25 +378,35 @@ static Module* loadInternal(const std::vector<std::string>& inputs, const std::v
     }
     bool checkMNNBuffer = true;
     if (nullptr != _rtMgr) {
-        checkMNNBuffer = _rtMgr->getInside()->modes.checkNetBuffer;
+        checkMNNBuffer = _rtMgr->getInside()->mContent->modes.checkNetBuffer;
     }
+    bool valid = true;
     if (checkMNNBuffer) {
-        flatbuffers::Verifier verify(buffer, length);
-        if (false == VerifyNetBuffer(verify)) {
-            MNN_PRINT("Invalidate buffer to create MNN Module\n");
-            return nullptr;
-        }
+        valid = OpCommonUtils::checkNet(buffer, length);
     }
-    // Check Auto Inputs and Outputs
-    auto net = GetNet(buffer);
-    if (nullptr == net->oplists() || nullptr == net->tensorName()) {
-        MNN_ERROR("Invalid net, for null oplist or tensorName\n");
+    if (!valid) {
         return nullptr;
     }
+    auto net = GetNet(buffer);
     Timer _time;
     std::shared_ptr<Module::Info> info(new Module::Info);
-    if (net->extraInfo() && net->extraInfo()->version()) {
-        info->version = net->extraInfo()->version()->str();
+    if (net->extraInfo()) {
+        if (net->extraInfo()->version()) {
+            info->version = net->extraInfo()->version()->str();
+        }
+        // Get Meta
+        if (net->extraInfo()->buffer()) {
+            auto extra = flatbuffers::GetRoot<Extra>(net->extraInfo()->buffer()->data());
+            if (nullptr != extra->attr()) {
+                for (int i=0; i<extra->attr()->size(); ++i) {
+                    auto attr = extra->attr()->GetAs<Attribute>(i);
+                    if (nullptr != attr->key() && nullptr != attr->s()) {
+                        // The model may be incomplete, avoid crash
+                        info->metaData.insert(std::make_pair(attr->key()->str(), attr->s()->str()));
+                    }
+                }
+            }
+        }
     }
     if (net->bizCode()) {
         info->bizCode = net->bizCode()->str();
@@ -397,7 +424,8 @@ static Module* loadInternal(const std::vector<std::string>& inputs, const std::v
         std::shared_ptr<Module> m(PipelineModule::load(inputs, outputs, buffer, length, rtMgr, config));
         return new NetModule(m, info, net, length, (float)_time.durationInUs() / 1000.0f);
     }
-    std::set<int> inputIdx, outputIdx, realInput, realOutput;
+    std::set<int> inputIdx, outputIdx, realOutput;
+    std::vector<int> realInput;
     for (int i=0; i< net->oplists()->size(); ++i) {
         auto op = net->oplists()->GetAs<Op>(i);
         if (nullptr != op->inputIndexes()) {
@@ -413,7 +441,7 @@ static Module* loadInternal(const std::vector<std::string>& inputs, const std::v
             for (int j=0; j<size; ++j) {
                 outputIdx.insert(data[j]);
                 if (op->type() == OpType_Input) {
-                    realInput.insert(data[j]);
+                    realInput.emplace_back(data[j]);
                 }
             }
         }

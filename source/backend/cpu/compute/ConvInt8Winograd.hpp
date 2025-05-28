@@ -11,6 +11,8 @@
 
 #include "backend/cpu/CPUConvolution.hpp"
 #include "backend/cpu/compute/Int8FunctionsOpt.h"
+#include "ConvInt8TiledExecutor.hpp"
+#ifndef MNN_REDUCE_SIZE
 
 namespace MNN {
 class ConvInt8Winograd : public CPUConvolution {
@@ -74,4 +76,5 @@ private:
     };
 };
 } // namespace MNN
+#endif
 #endif /* ConvInt8Winograd_hpp */

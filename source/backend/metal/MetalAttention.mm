@@ -13,6 +13,7 @@
 #import "MNNMetalContext.h"
 #import "MetalAttentionShader.hpp"
 #include "MNN_generated.h"
+#include "core/OpCommonUtils.hpp"
 
 #if MNN_METAL_ENABLED
 #ifdef MNN_SUPPORT_TRANSFORMER_FUSE
@@ -28,6 +29,8 @@ public:
     AttentionBufExecution(Backend *backend, bool kv_cache);
 
     virtual ~AttentionBufExecution() = default;
+    virtual ErrorCode onResize(const std::vector<Tensor *> &inputs, const std::vector<Tensor *> &outputs) override;
+
     virtual void onEncode(const std::vector<Tensor *> &inputs, const std::vector<Tensor *> &outputs, id<MTLComputeCommandEncoder> encoder) override;
     virtual bool onClone(Backend* bn, const Op* op, Execution** dst) override {
         if (nullptr == dst) {
@@ -41,15 +44,17 @@ public:
 
 private:
     void _init();
-    void reallocKVCache(int history_len);
+    void reallocKVCache();
     void compilerShader(const std::vector<Tensor *> &inputs);
+    void handleKVAllocMemory();
     bool mKVCache;
     std::shared_ptr<SharedCache> mCache;
     float mScale;
     const int mExpandChunk = 64;
-    bool mIsDecode = false;
+    bool mShortSeq = false;
     std::shared_ptr<Tensor> mTempQK, mTempSoftMax;
     int mNumHead = 0, mHeadDim = 0, mValueH = 0, mKvNumHead = 0;
+    int mSeqLen;
     id<MTLComputePipelineState> mKernel_softmax = nil;
     
     id<MTLComputePipelineState> mKernel_qk = nil;
@@ -62,22 +67,30 @@ private:
     id<MTLBuffer> mParamCopy;
     
 private:
+    KVMeta* mMeta;
     bool mQkSimdReduce = false;
     bool mQkSimdMatrix = false;
     bool mSftmSimdReduce = false;
     bool mQkvSimdReduce = false;
     bool mQkvSimdMatrix = false;
-    bool mUseHeadNum2 = false;
+private:
+    bool mHasMask = false;
+    bool mIsAddMask = false;
+    int mBatch, mKvSeqLen, mKvMaxLen;
+    int mQseqSplitNum = 1;
+    std::shared_ptr<Tensor> mTempK, mTempV;
 };
 
 struct Param {
     int query_seq_len;
+    int q_seq_piece_len;
     int key_seq_len;
     int head_num;
     int group;
     int head_dim;
     float scale;
     int max_kv_len;
+    int batch;
 };
 AttentionBufExecution::AttentionBufExecution(Backend *backend, bool kv_cahce)
     : MetalExecution(backend) , mKVCache(kv_cahce) {
@@ -87,119 +100,161 @@ void AttentionBufExecution::_init() {
     mCache.reset(new SharedCache);
     auto mtbn = static_cast<MetalBackend *>(backend());
     auto context = (__bridge MNNMetalContext *)mtbn->context();
+    mMeta = (KVMeta*)(mtbn->getRuntime()->pMeta);
+
     mParamQKV = [context newDeviceBuffer:sizeof(Param) access:CPUWriteOnly];
     mParamSoftmax = [context newDeviceBuffer:4 * sizeof(int) access:CPUWriteOnly];
-    mParamCopy = [context newDeviceBuffer:5 * sizeof(int) access:CPUWriteOnly];
+    mParamCopy = [context newDeviceBuffer:6 * sizeof(int) access:CPUWriteOnly];
     mTempQK.reset(Tensor::createDevice<float>({0, 0}));
     mTempSoftMax.reset(Tensor::createDevice<float>({0, 0}));
 }
 
-void AttentionBufExecution::reallocKVCache(int history_len) {
-    /*
-     when kv-cache
-     decoding: past_len > max_len, realloc and copy past_len cache
-     prefill : max_len == 0 (first prefill), realloc and copy history_len cache
-     prefill : max_len > 0 (not first prefill) && past_len >= max_len, realloc and copy history_len cache. copy current prompt in copy shader(not this function)
-     prefill : max_len > 0 (not first prefill) && past_len < max_len, not realloc and no need copy history_len cache, just copy current prompt in copy shader(not this function)
-
-     */
+void AttentionBufExecution::reallocKVCache() {
     if (!mKVCache) {
         return;
     }
+    auto kv_seq_len = mMeta->previous + mMeta->add - mMeta->remove + mMeta->computeReverseSize();
     
-    if (mIsDecode && mCache->mPastLength < mCache->mMaxLength) {
-        return;
-    }
-
-    // not first prefill (do reuse_kvcache) and total past_len < max_len
-    if(!mIsDecode && mCache->mMaxLength > 0 && mCache->mPastLength < mCache->mMaxLength && history_len != 0) {
-        return;
-    }
     auto mtbn = static_cast<MetalBackend *>(backend());
     int byte = 4;
     if(mtbn->useFp16InsteadFp32()) {
         byte = 2;
     }
-    bool needCopy = history_len > 0;
+    
+    auto start = mCache->mPastLength - mMeta->remove;
+    // latest length larger than maxLen
+    if (kv_seq_len > mCache->mMaxLength) {
 
-    size_t old_size = mKvNumHead * history_len * mHeadDim * byte;
-    size_t old_piece_size = history_len * byte;
-    size_t old_piece_stride = mCache->mMaxLength * byte;
-
-    mCache->mMaxLength = mCache->mPastLength + mExpandChunk;
-    // past_key: [1, numhead, headdim, maxlen]
-    auto new_key = Tensor::createDevice<float>({mCache->mMaxLength, mKvNumHead, mHeadDim});
-    // past_value: [1, numhead, maxlen, headdim]
-    auto new_value = Tensor::createDevice<float>({mKvNumHead, mHeadDim, mCache->mMaxLength});
-    size_t size = mKvNumHead * mCache->mMaxLength * mHeadDim * byte;
-    backend()->onAcquireBuffer(new_key, Backend::STATIC);
-    backend()->onAcquireBuffer(new_value, Backend::STATIC);
-    if (needCopy) {
-        auto newKeyBuf = MetalBackend::getBuffer(new_key);
-        auto new_key_ptr = (uint8_t*)[newKeyBuf.first contents] + newKeyBuf.second;
-        auto keyBuf = MetalBackend::getBuffer(mCache->mPastKey.get());
-        auto key_ptr = (uint8_t*)[keyBuf.first contents] + keyBuf.second;;
-        ::memcpy(new_key_ptr, key_ptr, old_size);
+        auto copy_len = mCache->mPastLength - mMeta->remove + mMeta->computeReverseSize();
+        bool needCopy = copy_len > 0;
         
-        auto newValueBuf = MetalBackend::getBuffer(new_value);
-        auto new_value_ptr = (uint8_t*)[newValueBuf.first contents] + newValueBuf.second;
+        size_t old_size = mKvNumHead * start * mHeadDim * byte;
+        size_t old_piece_size = start * byte;
+        size_t old_piece_stride = mCache->mMaxLength * byte;
+
+        mCache->mMaxLength = kv_seq_len + mExpandChunk;
+        // past_key: [1, numhead, headdim, maxlen]
+        auto new_key = Tensor::createDevice<float>({mCache->mMaxLength, mKvNumHead, mHeadDim});
+        // past_value: [1, numhead, maxlen, headdim]
+        auto new_value = Tensor::createDevice<float>({mKvNumHead, mHeadDim, mCache->mMaxLength});
+        size_t size = mKvNumHead * mCache->mMaxLength * mHeadDim * byte;
+        auto res = backend()->onAcquireBuffer(new_key, Backend::STATIC);
+        res = res && backend()->onAcquireBuffer(new_value, Backend::STATIC);
+        if(!res) {
+            MNN_ERROR("attition kv cache realloc memory error:%d\n", res);
+        }
+        if (needCopy) {
+            auto newKeyBuf = MetalBackend::getBuffer(new_key);
+            auto new_key_ptr = (uint8_t*)[newKeyBuf.first contents] + newKeyBuf.second;
+            auto keyBuf = MetalBackend::getBuffer(mCache->mPastKey.get());
+            auto key_ptr = (uint8_t*)[keyBuf.first contents] + keyBuf.second;;
+            ::memcpy(new_key_ptr, key_ptr, old_size);
+            
+            auto newValueBuf = MetalBackend::getBuffer(new_value);
+            auto new_value_ptr = (uint8_t*)[newValueBuf.first contents] + newValueBuf.second;
+            auto valueBuf = MetalBackend::getBuffer(mCache->mPastValue.get());
+            auto value_ptr = (uint8_t*)[valueBuf.first contents] + valueBuf.second;
+            for(int i = 0; i <  mKvNumHead * mHeadDim; i++) {
+                ::memcpy(new_value_ptr + i * mCache->mMaxLength * byte, value_ptr + i * old_piece_stride, old_piece_size);
+            }
+        }
+        mCache->mPastLength = (int)start;
+
+        mCache->mPastKey.reset(new_key);
+        mCache->mPastValue.reset(new_value);
+    }
+    
+    // Remove
+    {
+        if (0 == mMeta->n_reserve) {
+            mCache->mPastLength = start;
+            return;
+        }
+        
+        auto keyBuf = MetalBackend::getBuffer(mCache->mPastKey.get());
+        auto key_ptr = (uint8_t*)[keyBuf.first contents] + keyBuf.second;
         auto valueBuf = MetalBackend::getBuffer(mCache->mPastValue.get());
         auto value_ptr = (uint8_t*)[valueBuf.first contents] + valueBuf.second;
-        for(int i = 0; i <  mKvNumHead * mHeadDim; i++) {
-            ::memcpy(new_value_ptr + i * mCache->mMaxLength * byte, value_ptr + i * old_piece_stride, old_piece_size);
+        
+        // TODO: need to ensure reserve info is sorted
+        for (int n = 0; n < mMeta->n_reserve; ++n) {
+            auto begin = mMeta->reserve[2 * n];
+            auto length = mMeta->reserve[2 * n + 1];
+            // past_key   : [mCache->mPastLength, mKvNumHead, mHeadDim]
+            // past_value : [mKvNumHead, mHeadDim, mCache->mMaxLength]
+
+            auto copy_src_index = start + begin;
+            auto copy_dst_index = start;
+            for(int i = 0; i < length; i++) {
+                ::memcpy(key_ptr + (copy_dst_index + i) * mKvNumHead * mHeadDim * byte, key_ptr + (copy_src_index + i) * mKvNumHead * mHeadDim * byte, mKvNumHead * mHeadDim * byte);
+            }
+            for(int j = 0; j <  mKvNumHead * mHeadDim; j++) {
+                for(int i = 0; i < length; i++) {
+                    ::memcpy(value_ptr + (j * mCache->mMaxLength + copy_dst_index + i) * byte, value_ptr + (j * mCache->mMaxLength + copy_src_index + i) * byte, byte);
+                }
+            }
+            start += length;
         }
+        mCache->mPastLength = (int)start;
     }
-    mCache->mPastKey.reset(new_key);
-    mCache->mPastValue.reset(new_value);
 }
 
 void AttentionBufExecution::compilerShader(const std::vector<Tensor *> &inputs) {
-    auto mask = inputs[3];
     auto mtbn = static_cast<MetalBackend *>(backend());
     auto rt = (MetalRuntime*)mtbn->runtime();
     auto context = (__bridge MNNMetalContext *)mtbn->context();
-
+    
+    auto seq_len = inputs[0]->length(1);
+    int group_size = inputs[0]->length(2) / inputs[1]->length(2);
+    std::string group_str = std::to_string(group_size);
+    
     // Init Kernel
-    bool float_mask = (mask->getType() == halide_type_of<float>());
     std::string T = "float";
+    std::string T4 = "float4";
     if (mtbn->useFp16InsteadFp32()) {
         T = "half";
+        T4 = "half4";
     }
     std::vector<std::string> qkKeys = {
-        {"matmul_qk_div_mask", T}
+        {"matmul_qk_div_mask", T, group_str}
     };
-    if(mQkSimdReduce) {
-        qkKeys.emplace_back("SIMD_GROUP_REDUCE");
+    if(mHeadDim % 4 != 0) {
+        qkKeys.emplace_back("HEAD_DIM_UNALIGNED_4");
     }
     
-    // QK matmul total thread is large
-    mUseHeadNum2 = mIsDecode && mCache->mKv_seq_len > 1024;
-    if(mUseHeadNum2) {
-        qkKeys.emplace_back("HEAD_NUM_2");
-    }
     std::vector<std::string> qkvKeys = {
-        {"matmul_qkv", T}
+        {"matmul_qkv", T, group_str}
     };
     if(mQkvSimdReduce) {
         qkvKeys.emplace_back("SIMD_GROUP_REDUCE");
     }
     std::vector<std::string> qkPrefillKeys = {
-        {"matmul_qk_div_mask", T, "FOR_PREFILL"}
+        {"matmul_qk_div_mask", T, group_str, "FOR_PREFILL"}
     };
-    if (float_mask) {
-        qkPrefillKeys.emplace_back("FLOAT_MASK");
+    if(mHasMask) {
+        if (mIsAddMask) {
+            qkPrefillKeys.emplace_back("ADD_MASK");
+            if(seq_len > 1) {
+                qkKeys.emplace_back("ADD_MASK");
+            }
+        } else {
+            qkPrefillKeys.emplace_back("SET_MASK");
+            if(seq_len > 1) {
+                qkKeys.emplace_back("SET_MASK");
+            }
+        }
     }
     if(mQkSimdMatrix) {
         qkPrefillKeys.emplace_back("SIMD_GROUP_MATRIX");
     }
     std::vector<std::string> qkvPrefillKeys = {
-        {"matmul_qkv", T, "FOR_PREFILL"}
+        {"matmul_qkv", T, group_str, "FOR_PREFILL"}
     };
     if(mQkvSimdMatrix) {
         qkvPrefillKeys.emplace_back("SIMD_GROUP_MATRIX");
     }
     std::vector<std::string> copyPastKeys = {
-        {"pastkv_copy", T}
+        {"pastkv_copy", T, group_str}
     };
     std::vector<std::vector<std::string>> keys = {
         qkKeys,
@@ -230,7 +285,9 @@ void AttentionBufExecution::compilerShader(const std::vector<Tensor *> &inputs) 
             MTLCompileOptions *option = [[MTLCompileOptions alloc] init];
             auto dic = [NSMutableDictionary dictionaryWithCapacity:0];
             [dic setValue:@(keys[i][1].c_str()) forKey:@"T"];
-            for (int j=2; j<keys[i].size(); ++j) {
+            [dic setValue:@(T4.c_str()) forKey:@"T4"];
+            [dic setValue:@(keys[i][2].c_str()) forKey:@"GROUP_SIZE"];
+            for (int j=3; j<keys[i].size(); ++j) {
                 [dic setValue:@"1" forKey:@(keys[i][j].c_str())];;
             }
             option.preprocessorMacros = dic;
@@ -252,245 +309,307 @@ void AttentionBufExecution::compilerShader(const std::vector<Tensor *> &inputs) 
     MNN_ASSERT(nil != mKernel_copy);
 
     if(mSftmSimdReduce) {
-        mKernel_softmax = [context pipelineWithName:@"softmax_plane_sg" fp16:mtbn->useFp16InsteadFp32()];
+        // basic marco info
+        std::string ftype = "float";
+        std::string ftype4 = "float4";
+        if (mtbn->useFp16InsteadFp32()) {
+            ftype = "half";
+            ftype4 = "half4";
+        }
+
+        MTLCompileOptions *option = [[MTLCompileOptions alloc] init];
+        auto dic = [NSMutableDictionary dictionaryWithCapacity:0];
+        option.preprocessorMacros = @{
+            @"ftype" : @(ftype.c_str()),
+            @"ftype4" : @(ftype4.c_str()),
+        };
+        std::vector<std::string> keys = {"softmax_sg_reduce", ftype};
+        keys.emplace_back("softmax_plane_sg");
+        auto pipeline = rt->findPipeline(keys);
+        if (nil == pipeline) {
+            pipeline = mtbn->makeComputePipelineWithSourceOption(gSoftmaxSgReduce, keys.back().c_str(), option);
+            rt->insertPipeline(keys, pipeline);
+        }
+        mKernel_softmax = pipeline;
     } else {
         mKernel_softmax = [context pipelineWithName:@"softmax_plane" fp16:mtbn->useFp16InsteadFp32()];
     }
 
 }
 
-void AttentionBufExecution::onEncode(const std::vector<Tensor *> &inputs, const std::vector<Tensor *> &outputs, id<MTLComputeCommandEncoder> encoder) {
+void AttentionBufExecution::handleKVAllocMemory() {
+    if(mKVCache) {
+        mCache->mPastLength = mMeta != nullptr ? mMeta->previous : 0;
+        // kv-cache realloc function
+        reallocKVCache();
+        mCache->mKv_seq_len = mCache->mPastLength + mSeqLen;
+        mKvSeqLen = mCache->mKv_seq_len;
+        mKvMaxLen = mCache->mMaxLength;
+        
+        float useMemorySize = 1.0 * mKvMaxLen / 1024.0 * mSeqLen / 1024.0 * mBatch * mNumHead;
+        // elementSize larger than 32M
+        mQseqSplitNum = 1;
+        if(useMemorySize > 32.0) {
+            mQseqSplitNum = useMemorySize >= 256.0 ? 16 : ((useMemorySize < 128.0) ? 4 : 8);
+        }
 
+        int qSeqLenPiece = UP_DIV(mSeqLen, mQseqSplitNum);
+        // temp tensor alloc memory
+        bool needMalloc = mTempQK->length(0) != mBatch * mNumHead;
+        if (mTempQK->length(1) != qSeqLenPiece * mKvMaxLen) {
+            needMalloc = true;
+        }
+        mTempQK->setLength(0, mBatch * mNumHead);
+        mTempQK->setLength(1, qSeqLenPiece * mKvMaxLen);
+        mTempSoftMax->setLength(0, mBatch * mNumHead);
+        mTempSoftMax->setLength(1, qSeqLenPiece * mKvMaxLen);
+
+        if (needMalloc) {
+            auto res = backend()->onAcquireBuffer(mTempQK.get(), Backend::STATIC) && backend()->onAcquireBuffer(mTempSoftMax.get(), Backend::STATIC);
+            if (!res) {
+                MNN_ERROR("MNN::Metal: OUT_OF_MEMORY when execute attention metal %d\n", res);
+                return;
+            }
+        }
+    }
+}
+ErrorCode AttentionBufExecution::onResize(const std::vector<Tensor *> &inputs, const std::vector<Tensor *> &outputs) {
+    mHasMask = inputs.size() > 3;
+    if(mHasMask) {
+        mIsAddMask = (inputs[3]->getType() == halide_type_of<float>());
+    }
     auto query = inputs[0];
     auto key = inputs[1];
     auto value = inputs[2];
-    auto mask = inputs[3];
     auto mtbn = static_cast<MetalBackend *>(backend());
     auto context = (__bridge MNNMetalContext *)mtbn->context();
     auto shape = query->shape();
-    int seq_len = shape[1];
+    mBatch = shape[0];
+    mSeqLen = shape[1];
     mNumHead = shape[2];
     mHeadDim = shape[3];
     mScale = 1.0 / sqrt(mHeadDim);
-    mIsDecode = seq_len == 1;
-
-    int history_len = mCache->mPastLength;
-    // first prefill set history_len to 0
-    if(!mIsDecode && mask->length(2) == mask->length(3)) {
-        history_len = 0;
-    }
-    if (!mIsDecode) {
-        mCache->mPastLength = mask->length(3);
-    }
-    mCache->mKv_seq_len = mCache->mPastLength;
-    if(mIsDecode){
-        mCache->mKv_seq_len = mCache->mPastLength + 1;
-    }
+    // TODO : define short_seq more accurately
+    mShortSeq = mSeqLen <= 10;
     mKvNumHead = key->shape()[2];
+    mKvSeqLen = key->shape()[1];
+    mKvMaxLen = ROUND_UP(mKvSeqLen, 4);
     
+    if(mKVCache) {
+        return NO_ERROR;
+    }
+    
+    float useMemorySize = 1.0 * mKvMaxLen / 1024.0 * mSeqLen / 1024.0 * mBatch * mNumHead;
+    // elementSize larger than 32M
+    mQseqSplitNum = 1;
+    if(useMemorySize > 32.0) {
+        mQseqSplitNum = useMemorySize >= 256.0 ? 8 : ((useMemorySize < 128.0) ? 2 : 4);
+    }
+    
+    // no kv_cache memory, should create temp q/k memory
+    mTempK.reset(Tensor::createDevice<float>({mKvMaxLen * mHeadDim * mBatch * mKvNumHead}));
+    mTempV.reset(Tensor::createDevice<float>({mKvMaxLen * mHeadDim * mBatch * mKvNumHead}));
+    mTempQK.reset(Tensor::createDevice<float>({mKvMaxLen * UP_DIV(mSeqLen, mQseqSplitNum) * mBatch * mNumHead}));
+    mTempSoftMax.reset(Tensor::createDevice<float>({mKvMaxLen * UP_DIV(mSeqLen, mQseqSplitNum) * mBatch * mNumHead}));
+    
+    backend()->onAcquireBuffer(mTempK.get(), Backend::DYNAMIC);
+    backend()->onAcquireBuffer(mTempV.get(), Backend::DYNAMIC);
+    backend()->onAcquireBuffer(mTempQK.get(), Backend::DYNAMIC);
+    backend()->onAcquireBuffer(mTempSoftMax.get(), Backend::DYNAMIC);
+    backend()->onReleaseBuffer(mTempK.get(), Backend::DYNAMIC);
+    backend()->onReleaseBuffer(mTempV.get(), Backend::DYNAMIC);
+    backend()->onReleaseBuffer(mTempQK.get(), Backend::DYNAMIC);
+    backend()->onReleaseBuffer(mTempSoftMax.get(), Backend::DYNAMIC);
+    return NO_ERROR;
+}
+void AttentionBufExecution::onEncode(const std::vector<Tensor *> &inputs, const std::vector<Tensor *> &outputs, id<MTLComputeCommandEncoder> encoder) {
+    if(mKVCache) {
+        // if has kv_cache, default has mask
+        MNN_ASSERT(inputs.size() > 3);
+    }
+    auto query = inputs[0];
+    auto key = inputs[1];
+    auto value = inputs[2];
+    auto mtbn = static_cast<MetalBackend *>(backend());
+    auto context = (__bridge MNNMetalContext *)mtbn->context();
     auto rt = (MetalRuntime*)mtbn->runtime();
+
+    int group_size = mNumHead / mKvNumHead;
+    
+    // temp memory alloc, handle variable set
+    Tensor* tempTensorK;
+    Tensor* tempTensorV;
+    handleKVAllocMemory();
+    
+    if(mKVCache) {
+        tempTensorK = mCache->mPastKey.get();
+        tempTensorV = mCache->mPastValue.get();
+    } else {
+        tempTensorK = mTempK.get();
+        tempTensorV = mTempV.get();
+    }
+    
+    // whether use simdgroup
     bool supportSimdReduce = rt->supportSimdGroupReduce();
     bool supportSimdMatrix = rt->supportSimdGroupMatrix();
 
     // decode and thread number not too large
-    mQkSimdReduce = supportSimdReduce && seq_len == 1;
+    mQkSimdReduce = supportSimdReduce && mShortSeq;
     // loop_k can divide 8, thus avoid branch
-    mQkSimdMatrix = supportSimdMatrix && seq_len >= 16 && mHeadDim % 8 == 0;
+    mQkSimdMatrix = supportSimdMatrix && mSeqLen >= 16 && mHeadDim % 8 == 0;
 
     mSftmSimdReduce = supportSimdReduce;
-    mQkvSimdReduce = supportSimdReduce && seq_len == 1 && mHeadDim * mNumHead < mCache->mKv_seq_len * 32;
-    mQkvSimdMatrix = supportSimdMatrix && seq_len >= 16;
+    mQkvSimdReduce = supportSimdReduce && mShortSeq && mHeadDim * mNumHead < mKvSeqLen * 32;
+    mQkvSimdMatrix = supportSimdMatrix && mSeqLen >= 16;
     
     // start to compile attention shaders
     compilerShader(inputs);
     
-    int group_size = mNumHead / mKvNumHead;
-
-    // kv-cache realloc function
-    reallocKVCache(history_len);
-    
-    // temp tensor alloc memory
-    bool needMalloc = mTempQK->length(0) != mNumHead;
-    if (mIsDecode) {
-        if (mTempQK->length(1) != mCache->mMaxLength) {
-            needMalloc = true;
-        }
-        mTempQK->setLength(0, mNumHead);
-        mTempQK->setLength(1, mCache->mMaxLength);
-        mTempSoftMax->setLength(0, mNumHead);
-        mTempSoftMax->setLength(1, mCache->mMaxLength);
-
-    } else {
-        if (mTempQK->length(1) != seq_len * mCache->mPastLength) {
-            needMalloc = true;
-        }
-        mTempQK->setLength(0, mNumHead);
-        mTempQK->setLength(1, seq_len * mCache->mPastLength);
-        mTempSoftMax->setLength(0, mNumHead);
-        mTempSoftMax->setLength(1, seq_len * mCache->mPastLength);
-    }
-    if (needMalloc) {
-        auto res = backend()->onAcquireBuffer(mTempQK.get(), Backend::STATIC) && backend()->onAcquireBuffer(mTempSoftMax.get(), Backend::STATIC);
-        if (!res) {
-            MNN_ERROR("MNN::Metal: OUT_OF_MEMORY when execute attention metal %d\n", mCache->mPastLength);
-            return;
-        }
-    }
-
-    // Update Parameters
-    {
-        auto param = (Param*)mParamQKV.contents;
-        param->scale = mScale;
-        param->head_dim = mHeadDim;
-        param->key_seq_len = mCache->mKv_seq_len;
-        param->head_num = mNumHead;
-        param->group = group_size;
-        param->query_seq_len = seq_len;
-        param->max_kv_len = mCache->mMaxLength;
-    }
-    // For softmax parameter
-    int inside, outside;
-    if (mIsDecode) {
-        inside = 1;
-        outside = mNumHead;
-    } else {
-        inside = 1;
-        outside = seq_len * mNumHead;
-    }
-    int axis = mCache->mKv_seq_len;
-    {
-        auto softmax = (int*)mParamSoftmax.contents;
-        // Inside, axis, outside, plane(invalid)
-        softmax[0] = inside;
-        softmax[1] = axis;
-        softmax[2] = outside;
-        softmax[3] = 0;
-    }
-    
-    // Run Copy Kernel
+    // Run Copy and Format-Convert Kernel
     {
         auto copyp = (int*)mParamCopy.contents;
+        /*
+         Key -> K-Cache :   [mBatch, mKvSeqLen, mKvNumHead, mHeadDim] -> [mKvMaxLen, mBatch, mKvNumHead, mHeadDim]
+         Value -> V-Cache : [mBatch, mKvSeqLen, mKvNumHead, mHeadDim] -> [mBatch, mKvNumHead, mHeadDim, mKvMaxLen (fill when decode)]
+         */
         copyp[0] = mKvNumHead * mHeadDim;
-        
-        int copy_line;
-        if(mIsDecode) {
-            /*
-             each decode fill one kv_seq.
-             Key -> K-Cache :   [1, mKvNumHead, mHeadDim] -> [mCache->mKv_seq_len + 1, mKvNumHead, mHeadDim]
-             Value -> V-Cache : [1, mKvNumHead, mHeadDim] -> [mKvNumHead, mHeadDim, mCache->mKv_seq_len + 1]
-             */
-            copyp[1] = 1;
-            copyp[2] = mCache->mMaxLength;
-            copyp[3] = (mCache->mKv_seq_len - 1) * copyp[0];
-            copyp[4] = mCache->mKv_seq_len - 1;
-            copy_line = 1;
-        } else {
-            /*
-             first time copy.
-             Key -> K-Cache :   [mCache->mKv_seq_len, mKvNumHead, mHeadDim] -> [mCache->mKv_seq_len, mKvNumHead, mHeadDim]
-             Value -> V-Cache : [mCache->mKv_seq_len, mKvNumHead, mHeadDim] -> [mKvNumHead, mHeadDim, mCache->mMaxLength (fill when decode)]
-             */
-            copyp[1] = seq_len;
-            copyp[2] = mCache->mMaxLength;
-            copyp[3] = history_len * copyp[0];
-            copyp[4] = history_len;
-            copy_line = seq_len;
-        }
+        // current new kv_len
+        copyp[1] = key->shape()[1];
+        copyp[2] = mKvMaxLen;
+        copyp[3] = mCache->mPastLength * copyp[0];
+        copyp[4] = mCache->mPastLength;
+        copyp[5] = mBatch;
+        int copy_line = key->shape()[1];
 
         id<MTLComputePipelineState> pipeline = mKernel_copy;
         [encoder setComputePipelineState:pipeline];
         MetalBackend::setTensor(key, encoder, 0);
         MetalBackend::setTensor(value, encoder, 1);
-        MetalBackend::setTensor(mCache->mPastKey.get(), encoder, 2);
-        MetalBackend::setTensor(mCache->mPastValue.get(), encoder, 3);
+        MetalBackend::setTensor(tempTensorK, encoder, 2);
+        MetalBackend::setTensor(tempTensorV, encoder, 3);
         [encoder setBuffer:mParamCopy offset:0 atIndex:4];
         
         std::pair<MTLSize, MTLSize> gl;
-        gl = [context computeBestGroupAndLocal:pipeline threads:MTLSizeMake(mKvNumHead * mHeadDim, copy_line, 1)];
+        gl = [context computeBestGroupAndLocal:pipeline threads:MTLSizeMake(mKvNumHead * mHeadDim, copy_line, mBatch)];
 
         [encoder dispatchThreadgroups:gl.first threadsPerThreadgroup:gl.second];
 
     }
-    // Run QK Kernel
+    
+    // Update Parameters
+    int seqLenPiece = UP_DIV(mSeqLen, mQseqSplitNum);
     {
-        id<MTLComputePipelineState> pipeline;
-        if (mIsDecode) {
-            pipeline = mKernel_qk;
-        } else {
-            pipeline = mKernelPrefill_qk;
-        }
-        [encoder setComputePipelineState:pipeline];
-        MetalBackend::setTensor(query, encoder, 0);
-        MetalBackend::setTensor(mTempQK.get(), encoder, 1);
-        MetalBackend::setTensor(mCache->mPastKey.get(), encoder, 2);
-        MetalBackend::setTensor(mask, encoder, 3);
-        [encoder setBuffer:mParamQKV offset:0 atIndex:4];
-
-        int decode_grid_y = mNumHead;
-        if(mUseHeadNum2) {
-            decode_grid_y = (decode_grid_y + 1) / 2;
-        }
-        std::pair<MTLSize, MTLSize> gl;
-        if(mQkSimdReduce) {
-            gl = std::make_pair(MTLSizeMake(seq_len, decode_grid_y, mCache->mKv_seq_len), MTLSizeMake(32, 1, 1));
-        } else if(mQkSimdMatrix) {
-            gl = std::make_pair(MTLSizeMake(UP_DIV(seq_len, 16), UP_DIV(mCache->mKv_seq_len, 16), mNumHead), MTLSizeMake(32, 1, 1));
-        } else if(mIsDecode){
-            gl = [context computeBestGroupAndLocal:pipeline threads:MTLSizeMake(seq_len, decode_grid_y, mCache->mKv_seq_len)];
-        } else {
-            gl = [context computeBestGroupAndLocal:pipeline threads:MTLSizeMake(seq_len, mNumHead, mCache->mKv_seq_len)];
-        }
-        [encoder dispatchThreadgroups:gl.first threadsPerThreadgroup:gl.second];
-
+        auto param = (Param*)mParamQKV.contents;
+        param->scale = mScale;
+        param->head_dim = mHeadDim;
+        param->key_seq_len = mKvSeqLen;
+        param->head_num = mNumHead;
+        param->group = group_size;
+        param->query_seq_len = mSeqLen;
+        param->q_seq_piece_len = seqLenPiece;
+        param->max_kv_len = mKvMaxLen;
+        param->batch = mBatch;
     }
-    // Run Softmax Kernel
-    {
-        [encoder setComputePipelineState:mKernel_softmax];
-        MetalBackend::setTensor(mTempQK.get(), encoder, 0);
-        MetalBackend::setTensor(mTempSoftMax.get(), encoder, 1);
-        [encoder setBuffer:mParamSoftmax offset:0 atIndex:2];
-
-        int thread_group_size = 32;
-        std::pair<MTLSize, MTLSize> gl;
-        if(mSftmSimdReduce) {
-            gl = std::make_pair(MTLSizeMake(inside, outside, 1), MTLSizeMake(thread_group_size, 1, 1));
-        } else {
-            gl = [context computeBestGroupAndLocal: mKernel_softmax threads:MTLSizeMake(inside, outside, 1)];
+    
+    for(int seq_idx = 0; seq_idx < mQseqSplitNum; seq_idx++) {
+        // Run QK Kernel
+        {
+            id<MTLComputePipelineState> pipeline;
+            if (mShortSeq) {
+                pipeline = mKernel_qk;
+            } else {
+                pipeline = mKernelPrefill_qk;
+            }
+            [encoder setComputePipelineState:pipeline];
+            // [mBatch, mSeqLen, mNumHead, mHeadDim]
+            MetalBackend::setTensor(query, encoder, 0);
+            // [mBatch, mNumHead, mSeqLen, mKvSeqLen]
+            MetalBackend::setTensor(mTempQK.get(), encoder, 1);
+            // [mKvSeqLen, mBatch, mKvNumHead, mHeadDim]
+            MetalBackend::setTensor(tempTensorK, encoder, 2);
+            [encoder setBytes:&seq_idx length:sizeof(seq_idx) atIndex:3];
+            [encoder setBuffer:mParamQKV offset:0 atIndex:4];
+            if(mHasMask) {
+                MetalBackend::setTensor(inputs[3], encoder, 5);
+            }
+            
+            int decode_grid_y = mBatch * mNumHead;
+            std::pair<MTLSize, MTLSize> gl;
+            if(mShortSeq) {
+                gl = [context computeBestGroupAndLocal:pipeline threads:MTLSizeMake(seqLenPiece, decode_grid_y / group_size, mKvSeqLen)];
+            } else if(mQkSimdMatrix) {
+                gl = std::make_pair(MTLSizeMake(UP_DIV(seqLenPiece, 16), UP_DIV(mKvSeqLen, 16), decode_grid_y), MTLSizeMake(32, 1, 1));
+            } else {
+                gl = [context computeBestGroupAndLocal:pipeline threads:MTLSizeMake(seqLenPiece, decode_grid_y, mKvSeqLen)];
+            }
+            [encoder dispatchThreadgroups:gl.first threadsPerThreadgroup:gl.second];
+            
         }
-
-        [encoder dispatchThreadgroups:gl.first threadsPerThreadgroup:gl.second];
-
-    }
-    // Run QKV Kernel
-    {
-        id<MTLComputePipelineState> pipeline;
-        if (mIsDecode) {
-            pipeline = mKernel_qkv;
-        } else {
-            pipeline = mKernelPrefill_qkv;
+        // Run Softmax Kernel
+        {
+            // For softmax parameter
+            // [mBatch, mNumHead, mSeqLen, mKvSeqLen]
+            int inside = 1;
+            int outside = mBatch * mNumHead * seqLenPiece;
+            int axis = mKvSeqLen;
+            {
+                auto softmax = (int*)mParamSoftmax.contents;
+                // Inside, axis, outside, plane(invalid)
+                softmax[0] = inside;
+                softmax[1] = axis;
+                softmax[2] = outside;
+                softmax[3] = 0;
+            }
+            [encoder setComputePipelineState:mKernel_softmax];
+            MetalBackend::setTensor(mTempQK.get(), encoder, 0);
+            MetalBackend::setTensor(mTempSoftMax.get(), encoder, 1);
+            [encoder setBuffer:mParamSoftmax offset:0 atIndex:2];
+            
+            int thread_group_size = 32;
+            std::pair<MTLSize, MTLSize> gl;
+            if(mSftmSimdReduce) {
+                gl = std::make_pair(MTLSizeMake(inside, outside, 1), MTLSizeMake(thread_group_size, 1, 1));
+            } else {
+                gl = [context computeBestGroupAndLocal: mKernel_softmax threads:MTLSizeMake(inside, outside, 1)];
+            }
+            
+            [encoder dispatchThreadgroups:gl.first threadsPerThreadgroup:gl.second];
+            
         }
-        [encoder setComputePipelineState:pipeline];
-        MetalBackend::setTensor(mTempSoftMax.get(), encoder, 0);
-        MetalBackend::setTensor(outputs[0], encoder, 1);
-        MetalBackend::setTensor(mCache->mPastValue.get(), encoder, 2);
-        [encoder setBuffer:mParamQKV offset:0 atIndex:3];
-        std::pair<MTLSize, MTLSize> gl;
-        if(mQkvSimdReduce) {
-            gl = std::make_pair(MTLSizeMake(seq_len, mNumHead, mHeadDim), MTLSizeMake(32, 1, 1));
-        } else if(mQkvSimdMatrix){
-            gl = std::make_pair(MTLSizeMake(UP_DIV(seq_len, 16), UP_DIV(mHeadDim, 16), mNumHead), MTLSizeMake(32, 1, 1));
-        } else {
-            gl = [context computeBestGroupAndLocal:pipeline threads:MTLSizeMake(seq_len, mNumHead, mHeadDim)];
+        // Run QKV Kernel
+        {
+            
+            id<MTLComputePipelineState> pipeline;
+            if (mShortSeq) {
+                pipeline = mKernel_qkv;
+            } else {
+                pipeline = mKernelPrefill_qkv;
+            }
+            [encoder setComputePipelineState:pipeline];
+            // [mBatch, mNumHead, mSeqLen, mKvSeqLen]
+            MetalBackend::setTensor(mTempSoftMax.get(), encoder, 0);
+            // [mBatch, mSeqLen, mNumHead, mHeadDim]
+            MetalBackend::setTensor(outputs[0], encoder, 1);
+            // [mBatch, mKvNumHead, mHeadDim, mMaxSeqLen]
+            MetalBackend::setTensor(tempTensorV, encoder, 2);
+            [encoder setBytes:&seq_idx length:sizeof(seq_idx) atIndex:3];
+            [encoder setBuffer:mParamQKV offset:0 atIndex:4];
+            std::pair<MTLSize, MTLSize> gl;
+            if(mQkvSimdReduce) {
+                gl = std::make_pair(MTLSizeMake(seqLenPiece, mBatch * mNumHead, mHeadDim), MTLSizeMake(32, 1, 1));
+            } else if(mQkvSimdMatrix){
+                gl = std::make_pair(MTLSizeMake(UP_DIV(seqLenPiece, 16), UP_DIV(mHeadDim, 16), mBatch * mNumHead), MTLSizeMake(32, 1, 1));
+            } else {
+                gl = [context computeBestGroupAndLocal:pipeline threads:MTLSizeMake(seqLenPiece, mBatch * mNumHead, mHeadDim)];
+            }
+            [encoder dispatchThreadgroups:gl.first threadsPerThreadgroup:gl.second];
+            
         }
-        [encoder dispatchThreadgroups:gl.first threadsPerThreadgroup:gl.second];
-
     }
     // Update status
-    if(mIsDecode){
-        mCache->mPastLength += 1;
-        mCache->mKv_seq_len = mCache->mPastLength + 1;
+    if(mKVCache) {
+        mCache->mPastLength += mSeqLen;
     }
-
     return;
 }
 

@@ -309,7 +309,7 @@ public:
                     for (int i3 = 0; i3 < pxpy.size(); i3++) {
                         for (int i4 = 0; i4 < sxsy.size(); i4++) {
                             for (int i5 = 0; i5 < dxdy.size(); i5++) {
-                                for (int i6 = 3; i6 < iwih.size(); i6++) {
+                                for (int i6 = 0; i6 < iwih.size(); i6++) {
                                     auto res = testKernel(iwih[i6], kxky[i0], icoc[i1], pxpy[i3], sxsy[i4], dxdy[i5], 8, false, 1, batch[i2], MNN::SparseAlgo_RANDOM, 1, false);
                                     if (!res) {
                                         MNN_ERROR("kx=%d, ky=%d, iw=%d, ih=%d, overflow=false, bit=8, batch=%d, Conv info: sx=%d, sy=%d, dx=%d, dy=%d, px=%d, py=%d, ic=%d, oc=%d\n", 
@@ -698,35 +698,49 @@ class ConvSpeedInt8WinogradTest : public ConvInt8WinogradTestCommon {
 class DepthwiseConvInt8Test : public ConvInt8TestCommon {
 public:
     virtual bool run(int precision) {
-        INTS strides = {1, 1}, dilate = {1, 1}, pad = {0, 0}, inputShape = {21, 13}; // {w, h}
-        int channel = 64;
+        INTS dilate = {1, 1}; // {w, h}
         std::vector<std::vector<int>> kernels = {
-            {3, 3}
+            {3, 3}, {1, 3}, {1, 5}, {1, 1}, {1, 7}
         };
-        std::vector<std::string> titles = {
-            "3x3"
-        };
-        printf("Test strides=1\n");
-        for (int i = 0; i < kernels.size(); ++i) {
-            auto res = testKernel(inputShape, kernels[i], {channel, channel}, pad, strides, dilate, 8, false, channel, 4, MNN::SparseAlgo_RANDOM, 1, false);
-            if (!res) {
-                FUNC_PRINT(1);
-                return false;
-            }
-        }
-        for (int i = 0; i < kernels.size(); ++i) {
-            auto res = testKernel(inputShape, kernels[i], {channel, channel}, pad, strides, dilate, 3, true, channel, 1, MNN::SparseAlgo_RANDOM, 1, false);
-            if (!res) {
-                FUNC_PRINT(1);
-                return false;
-            }
-        }
-        printf("strides=2\n");
-        for (int i = 0; i < kernels.size(); ++i) {
-            auto res = testKernel(inputShape, kernels[i], {channel, channel}, pad, {2, 2}, dilate, 8, true, channel, 1, MNN::SparseAlgo_RANDOM, 1, false);
-            if (!res) {
-                FUNC_PRINT(1);
-                return false;
+        std::vector< std::vector<int>> inputHW = {{3, 10}, {10, 3}, {1, 17}, {15, 1}, {7, 56}, {21, 13}, {7, 8}};
+        std::vector<int> ics = {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 16, 32, 33};
+        std::vector<std::vector<int>> pads = { {0, 0}, {1, 1}, {0, 1}};
+        std::vector<int> strides = {1, 2};
+        for (auto& inputShape: inputHW) {
+            for (auto& kernel: kernels) {
+                for (auto& channel: ics) {
+                    for (auto& pad: pads) {
+                        for (auto& stride: strides) {
+                            if (inputShape[0] < kernel[0] || inputShape[1] < kernel[1]) {
+                                continue;
+                            }
+                            auto res = testKernel(inputShape, kernel, {channel, channel}, pad, {stride, stride}, dilate, 8, false, channel, 4, MNN::SparseAlgo_RANDOM, 1, false);
+                            if (!res) {
+                                MNN_PRINT("inputShape=(%d %d), kernel=(%d %d), channel=%d, pad=(%d %d), stride=%d, dilate=%d, nbit=8\n", 
+                                          inputShape[0], inputShape[1], kernel[0], kernel[1], channel, pad[0], pad[1], stride,dilate[0] );
+                                return false;
+                            }
+                            res = testKernel(inputShape, kernel, {channel, channel}, pad, {stride, stride}, dilate, 3, false, channel, 4, MNN::SparseAlgo_RANDOM, 1, false);
+                            if (!res) {
+                                MNN_PRINT("inputShape=(%d %d), kernel=(%d %d), channel=%d, pad=(%d %d), stride=%d, dilate=%d, nbit=3\n", 
+                                          inputShape[0], inputShape[1], kernel[0], kernel[1], channel, pad[0], pad[1], stride,dilate[0] );
+                                return false;
+                            }
+                            res = testKernel(inputShape, kernel, {channel, channel}, pad, {stride, stride}, dilate, 8, false, channel, 1, MNN::SparseAlgo_RANDOM, 1, false);
+                            if (!res) {
+                                MNN_PRINT("inputShape=(%d %d), kernel=(%d %d), channel=%d, pad=(%d %d), stride=%d, dilate=%d, nbit=8\n", 
+                                          inputShape[0], inputShape[1], kernel[0], kernel[1], channel, pad[0], pad[1], stride,dilate[0] );
+                                return false;
+                            }
+                            res = testKernel(inputShape, kernel, {channel, channel}, pad, {stride, stride}, dilate, 8, false, channel, 1, MNN::SparseAlgo_RANDOM, 1, false);
+                            if (!res) {
+                                MNN_PRINT("inputShape=(%d %d), kernel=(%d %d), channel=%d, pad=(%d %d), stride=%d, dilate=%d, nbit=8\n", 
+                                          inputShape[0], inputShape[1], kernel[0], kernel[1], channel, pad[0], pad[1], stride,dilate[0] );
+                                return false;
+                            }
+                        }
+                    }
+                }
             }
         }
         return true;
