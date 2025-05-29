@@ -45,28 +45,24 @@ static Execution* _createUnit(const Tensor* input, const Tensor* output, Backend
     bool fastWay = common->kernelY() == 1 && common->kernelX() == 1
         && output->width() == input->width() && output->height() == input->height()
         && common->strideX() == 1 && common->strideY() == 1;
-
+#ifdef MNN_LOW_MEMORY
     if (lowMemory && nullptr != weightQuantInfo.get() && originWeightSize == 0) {
         if (cpuBackend->memoryMode() == BackendConfig::Memory_Low) {
-            // auto core = static_cast<CPUBackend*>(backend)->functions();
-            // auto resourceInt8 = CPUConvolution::makeResourceInt8(backend, op, core->pack);
-            // return new DenseConvInt8TiledExecutor(backend, op, resourceInt8, true);
-            return new DenseConvInt8TiledExecutor(backend, op, weightQuantInfo);
+            return new DenseConvInt8TiledExecutor(backend, op, weightQuantInfo, true);
         } else {
             return new DenseConvolutionTiledExecutor(common, backend, originWeight, originWeightSize, bias, biasSize, weightQuantInfo);
         }
     }
-#ifndef MNN_LOW_MEMORY
+#else
     if (cpuBackend->memoryMode() == BackendConfig::Memory_Low) {
         return new DenseConvolutionTiledExecutor(common, backend, originWeight, originWeightSize, bias, biasSize, weightQuantInfo);
     }
 #endif
+#ifndef MNN_REDUCE_SIZE
     if (fastWay && cpuBackend->functions()->matmulBytes == 0) {
-        return new Convolution1x1Strassen(common, backend, originWeight, originWeightSize, bias, biasSize, weightQuantInfo);
+        return new Convolution1x1Strassen(common, backend, originWeight, originWeightSize, bias, biasSize);
     }
-    if (originWeightSize == 0) {
-        return new DenseConvolutionTiledExecutor(common, backend, originWeight, originWeightSize, bias, biasSize, weightQuantInfo);
-    }
+#endif
     if (cpuBackend->getRuntime()->hint().winogradMemoryUsed == 0 || (!ConvolutionWinogradBridge::canUseWinograd(common))) {
         return new DenseConvolutionTiledExecutor(common, backend, originWeight, originWeightSize, bias, biasSize, nullptr);
     }
@@ -147,7 +143,7 @@ Execution* ConvolutionFloatFactory::create(const std::vector<Tensor*>& inputs, c
         originWeight     = op->main_as_Convolution2D()->weight()->data();
         originWeightSize = op->main_as_Convolution2D()->weight()->size();
     }
-    if (nullptr == originBias) {
+    if (nullptr == originBias && op->main_as_Convolution2D()->bias()) {
         originBias     = op->main_as_Convolution2D()->bias()->data();
         originBiasSize = op->main_as_Convolution2D()->bias()->size();
     }

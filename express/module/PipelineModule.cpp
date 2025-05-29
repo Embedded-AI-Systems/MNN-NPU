@@ -9,10 +9,12 @@
 #include "PipelineModule.hpp"
 #include <set>
 #include <vector>
+#include "ModuleInside.hpp"
 #include "StaticModule.hpp"
 #include "IfModule.hpp"
 #include "WhileModule.hpp"
 #include "NMSModule.hpp"
+#include "MoEModule.hpp"
 #include "Utils.hpp"
 #include "core/Backend.hpp"
 #include "core/WrapExecution.hpp"
@@ -342,7 +344,8 @@ static bool isBreakOp(const Op* op) {
     if (op->type() == OpType_While && op->main_as_WhileParam() != nullptr) {
         isWhileControlflow = true;
     }
-    if (op->type() == OpType_If || isWhileControlflow || op->type() == OpType_Where || op->type() == OpType_Segment || op->type() == OpType_Unique || op->type() == OpType_NonMaxSuppressionV2) {
+    if (op->type() == OpType_If || isWhileControlflow || op->type() == OpType_Where || op->type() == OpType_Segment ||
+        op->type() == OpType_Unique || op->type() == OpType_NonMaxSuppressionV2 || op->type() == OpType_MoE) {
         return true;
     }
     return false;
@@ -612,7 +615,7 @@ static std::vector<SubModuleInfo> _createSubModuleInfo(std::shared_ptr<BufferSto
 
 struct ModuleRuntimeConfig {
     bool needGeometry;
-    RuntimeInfo rt;
+    std::shared_ptr<Executor::RuntimeManager> rt;
     Backend::Info compute;
     const BackendConfig* userConfig = nullptr;
     Session::ModeGroup modes;
@@ -631,6 +634,9 @@ static Module* _createSubModule(std::shared_ptr<BufferStorage> bufferStorage, co
         }
         if (OpType_NonMaxSuppressionV2 == op->type()) {
             return NMSModule::create(op);
+        }
+        if (OpType_MoE == op->type()) {
+            return MoEModule::create(op, subs, runtimeConfig.rt, config);
         }
         // MNN_ASSERT(false);
     }
@@ -712,6 +718,7 @@ Module* PipelineModule::load(const std::vector<std::string>& inputs, const std::
 
 Module* PipelineModule::load(const std::vector<std::string>& inputs, const std::vector<std::string>& outputs, std::shared_ptr<BufferStorage> bufferStorage, std::shared_ptr<MNN::Express::Executor::RuntimeManager> rtMgr, const Module::Config* config, std::map<std::string, SubGraph>& subGraphMap) {
     MNN_ASSERT(nullptr != rtMgr);
+    MNN_ASSERT(nullptr != config);
     std::shared_ptr<Schedule::ScheduleInfo> sharedConst;
     auto buffer = bufferStorage->buffer();
     auto length = bufferStorage->size();
@@ -720,12 +727,14 @@ Module* PipelineModule::load(const std::vector<std::string>& inputs, const std::
     // Extra Const Tensors
     sharedConst.reset(new Schedule::ScheduleInfo);
     auto curExe = ExecutorScope::Current();
-    bool permitCodeGen = false;
+    bool preReplaceConstTensor = true;
     std::shared_ptr<ModuleRuntimeConfig> modRuntimeCfgPtr(new ModuleRuntimeConfig);
-    if (!rtMgr->getInside()->mExternalFile.empty()) {
-        modRuntimeCfgPtr->externalFile = rtMgr->getInside()->mExternalFile;
+    if (!rtMgr->getInside()->mContent->mExternalFile.empty()) {
+        modRuntimeCfgPtr->externalFile = rtMgr->getInside()->mContent->mExternalFile;
     }
-    permitCodeGen = rtMgr->getInside()->modes.codegenMode == Interpreter::Session_Codegen_Enable;
+    if (rtMgr->getInside()->mContent->modes.codegenMode == Interpreter::Session_Codegen_Enable || (!config->shapeMutable)) {
+        preReplaceConstTensor = false;
+    }
     std::shared_ptr<Backend> defaultBackend = curExe->getAttr()->constantBackend;
     std::vector<std::shared_ptr<Tensor>> allTensors;
     sharedConst->allTensors.resize(net->tensorName()->size());
@@ -733,16 +742,15 @@ Module* PipelineModule::load(const std::vector<std::string>& inputs, const std::
     ModuleRuntimeConfig& modRuntime = *modRuntimeCfgPtr;
     modRuntime.needGeometry = needGeometry;
     {
-        modRuntime.modes = rtMgr->getInside()->modes;
-        modRuntime.rt = rtMgr->getInside()->mRuntime;
-        modRuntime.externalFile = rtMgr->getInside()->mExternalFile;
-        modRuntime.userConfig = &rtMgr->getInside()->mConfig;
-        modRuntime.compute.type      = modRuntime.rt.first.begin()->first;
-        modRuntime.compute.numThread = 1;
-        modRuntime.rt.first.begin()->second->setRuntimeHint(rtMgr->getInside()->modes.runtimeHint);
+        modRuntime.modes = rtMgr->getInside()->mContent->modes;
+        modRuntime.rt = rtMgr;
+        rtMgr->getInside()->mRuntime.first.begin()->second->setRuntimeHint(rtMgr->getInside()->mContent->modes.runtimeHint);
+        modRuntime.externalFile = rtMgr->getInside()->mContent->mExternalFile;
+        modRuntime.userConfig = &rtMgr->getInside()->mContent->mConfig;
+        modRuntime.compute.type = rtMgr->getInside()->mRuntime.first.begin()->first;
     }
-    auto& rt = modRuntime.rt;
-    auto firstRt = rt.first[modRuntime.compute.type];
+    auto& rt = modRuntime.rt->getInside()->mRuntime;
+    auto firstRt = rt.first.find(modRuntime.compute.type)->second;
     sharedConst->constReplaceBackend.reset(firstRt->onCreate(modRuntime.userConfig));
     ErrorCode code = NO_ERROR;
     std::set<int> noneedComputeIndexes;
@@ -795,7 +803,7 @@ Module* PipelineModule::load(const std::vector<std::string>& inputs, const std::
     for (int i=0; i<subModulesInfo.size(); ++i) {
         subModules[i].reset(_createSubModule(bufferStorage, subModulesInfo[i], subGraphMap, sharedConst, *config, modRuntime));
     }
-    if (!permitCodeGen) {
+    if (preReplaceConstTensor) {
         // Prereplace const tensor
         auto curBackend = sharedConst->constReplaceBackend.get();
         if (sharedConst->constReplaceBackend->type() != sharedConst->defaultBackend->type()) {

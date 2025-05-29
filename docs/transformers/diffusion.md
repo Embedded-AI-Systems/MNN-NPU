@@ -37,9 +37,9 @@ conda activate ldm
 python3 convert_mnn.py ../onnx ~/alicnn/AliNNPrivate/build/diffusion "--weightQuantBits=8"
 ```
 
-若希望在OpenCL后端上进一步加速，可加上--transformerFuse:
+若希望在OpenCL / Metal后端上进一步加速，可加上--transformerFuse:
 ```
-# 适用OpenCL 后端推理
+# 适用OpenCL / Metal后端推理
 python3 convert_mnn.py onnx_path mnn_save_path "--weightQuantBits=8 --transformerFuse"
 ```
 
@@ -49,37 +49,47 @@ python3 convert_mnn.py onnx_path mnn_save_path "--weightQuantBits=8 --transforme
 cd mnn_path
 mkdir build
 cd build
-cmake .. -DMNN_BUILD_DIFFUSION=ON -DMNN_BUILD_OPENCV=ON -DMNN_IMGCODECS=ON -DMNN_OPENCL=ON -DMNN_SEP_BUILD=OFF -DMNN_SUPPORT_TRANSFORMER_FUSE=ON
+cmake .. -DMNN_LOW_MEMORY=ON -DMNN_BUILD_DIFFUSION=ON -DMNN_BUILD_OPENCV=ON -DMNN_IMGCODECS=ON -DMNN_OPENCL=ON -DMNN_SEP_BUILD=OFF -DMNN_SUPPORT_TRANSFORMER_FUSE=ON
 make -j32
 ```
 ### Android上
 ```
 cd mnn_path/project/android/build
-../build_64.sh -DMNN_BUILD_DIFFUSION=ON -DMNN_BUILD_OPENCV=ON -DMNN_IMGCODECS=ON -DMNN_OPENCL=ON -DMNN_SEP_BUILD=OFF -DMNN_SUPPORT_TRANSFORMER_FUSE=ON
+../build_64.sh -DMNN_LOW_MEMORY=ON -DMNN_BUILD_DIFFUSION=ON -DMNN_BUILD_OPENCV=ON -DMNN_IMGCODECS=ON -DMNN_OPENCL=ON -DMNN_SEP_BUILD=OFF -DMNN_SUPPORT_TRANSFORMER_FUSE=ON
 ../updateTest.sh
 ```
 ## 运行Diffusion Demo
 ```
-./diffusion_demo <resource_path> <model_type> <output_image_name> <memory_mode> <backend_type> <input_text>
+./diffusion_demo <resource_path> <model_type> <memory_mode> <backend_type> <iteration_num> <random_seed> <output_image_name> <prompt_text>
 ```
 其中，resource_path 就是mnn模型文件的路径，除了mnn文件，还需要:
-1. 将MNN目录transformers/diffusion/scheduler/alphas.txt文件拷贝到该文件夹下。
-2. 针对stable-diffusion-v1-5/chilloutmix模型需要将huggingfacetokenizer目录下merges.txt和vocab.json拷贝到该文件夹中。
-3. 针对Taiyi-Stable-Diffusion模型需要将huggingfacetokenizer目录下vocab.txt拷贝到该文件夹中。
-4. model_type是目前支持的两种diffusion模型的类别。如果是stable-diffusion-v1-5/chilloutmix模型设为0，如果是Taiyi-Stable-Diffusion模型设为1。
-5. output_image_name是生成图片的名字，默认图片位置在当前运行目录下。
-6. memory_mode代表设备是否内存足够，设为0表示内存节约模式(demo中每个模型使用前等待初始化，用完释放)，1代表内存足够模式(所有模式启动时全初始化完，用时无需等待初始化)。
-7. backend_type代表选择的运行后端。
-8. input_text是文生图的prompt，如果是stable-diffusion-v1-5/chilloutmix模型建议英文prompt，如果是Taiyi-Stable-Diffusion建议中文prompt。
-
-运行指令例如: 
+### 资源拷贝
 ```
-./diffusion_demo mnn_sd1.5_path 0 demo.jpg 0 3 "a cute cat"
-./diffusion_demo mnn_chilloutmix_path 0 demo.jpg 0 3 "a pure girl"
-./diffusion_demo mnn_taiyi_path 1 demo.jpg 0 3 "一只可爱的猫"
+(a) 针对stable-diffusion-v1-5/chilloutmix模型需要将huggingfacetokenizer目录下merges.txt和vocab.json拷贝到resource_path文件夹中。
+(b) 针对Taiyi-Stable-Diffusion模型需要将huggingfacetokenizer目录下vocab.txt拷贝到resource_path文件夹中。
+```
+### 参数设置
+```
+1. model_type是目前支持的两种diffusion模型的类别。如果是stable-diffusion-v1-5/chilloutmix模型设为0，如果是Taiyi-Stable-Diffusion模型设为1。
+2. memory_mode代表设备是否内存足够，设为0表示内存节约模式(demo中每个模型使用前等待初始化，用完释放)，1代表内存足够模式(所有模式启动时全初始化完，性能快，运行时无需等待初始化), 2代表内存&性能折中模式(启动时初始化部分模型)。
+3. backend_type代表选择的运行后端，如OpenCL/Metal/CPU等。
+4. iteration_num代表文生图迭代次数，通常建议设置10到20之间。
+5. random_seed代表固定输入噪声种子数，设置为负数表示随机生成噪声种子数。当随机噪声种子数生成图片质量不佳时，可以调节该参数种子数值。
+
+```
+### 提示词和图片名称设置
+```
+1. output_image_name是生成图片的名字，默认图片位置在当前运行目录下。
+2. prompt_text是文生图的prompt，如果是stable-diffusion-v1-5/chilloutmix模型建议英文prompt，如果是Taiyi-Stable-Diffusion建议中文prompt。
+```
+### 运行命令示例
+```
+./diffusion_demo mnn_sd1.5_path 0 1 3 20 -1 demo.jpg "a cute cat"
+./diffusion_demo mnn_chilloutmix_path 0 0 3 10 42 demo.jpg "a pure girl"
+./diffusion_demo mnn_taiyi_path 1 0 3 10 -1 demo.jpg "一只可爱的猫"
 ```
 ## FAQ
 1. Demo运行报错、段错误，怎么解决？
-- 常见错误可能是设备内存不足，通常支持opencl fp16的设备需要保证3GB以上的内存，不支持fp16则需要6GB以上显存了。
+- 常见错误可能是设备内存不足，通常支持opencl fp16的设备需要保证2GB以上的内存，不支持fp16则需要4GB以上显存了。
 2. 使用其他后端，出现报错，什么原因？
 - 目前其他后端暂不支持transformer插件算子，需要在onnx->mnn模型转换阶段，去掉--transformerFuse。

@@ -83,6 +83,7 @@ static bool compareOutput(VARP output, const std::string& directName, const std:
     auto diffAbsMax = _ReduceMax(diff);
     auto absMaxV = absMax->readMap<float>()[0];
     auto diffAbsMaxV = diffAbsMax->readMap<float>()[0];
+    MNN_PRINT("For %s, max = %f, diffmax = %f, diff rate = %f\n", name.c_str(), absMaxV, diffAbsMaxV, diffAbsMaxV / fmaxf(absMaxV, 1e-6));
     if (absMaxV * 0.01f < diffAbsMaxV || MNN_IS_NAN(absMaxV)) {
         MNN_ERROR("TESTERROR %s value error : absMaxV:%f - DiffMax %f\n", name.c_str(), absMaxV, diffAbsMaxV);
         return false;
@@ -244,6 +245,8 @@ int main(int argc, char *argv[]) {
     mConfig.shapeMutable = shapeMutable;
     std::shared_ptr<Executor::RuntimeManager> rtmgr(Executor::RuntimeManager::createRuntimeManager(config));
     rtmgr->setCache(cacheFileName);
+    rtmgr->setHint(MNN::Interpreter::INIT_THREAD_NUMBER, 4);
+
     if (cpuDecreaseRate > 0 && cpuDecreaseRate <= 100) {
         rtmgr->setHint(Interpreter::CPU_LITTLECORE_DECREASE_RATE, cpuDecreaseRate);
     }
@@ -280,7 +283,12 @@ int main(int argc, char *argv[]) {
         rtmgr->setHint(Interpreter::WINOGRAD_MEMORY_LEVEL, 0);
     }
     if (runMask & 1024) {
-        rtmgr->setHint(Interpreter::DYNAMIC_QUANT_OPTIONS, 1);
+        /*
+        2: INPUT_BLOCK_QUANT
+        1: INPUT_SHARE_ONE_SCALE
+        0: INPUT_CHANNEL_QUANT
+        */
+        rtmgr->setHint(Interpreter::DYNAMIC_QUANT_OPTIONS, 2);
     }
     if (runMask & 2048) {
         rtmgr->setExternalPath("tmp", Interpreter::EXTERNAL_FEATUREMAP_DIR);

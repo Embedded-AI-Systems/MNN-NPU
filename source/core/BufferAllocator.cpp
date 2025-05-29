@@ -71,6 +71,9 @@ private:
     std::string mPosfix;
     int mAllocTimes = 0;
     bool mRemove;
+    bool mNewMmap = false;
+    bool mSynced = false;
+
 public:
     MmapAllocator(const char* dirName, const char* prefix, const char* posfix, bool autoRemove) {
         if (nullptr != dirName) {
@@ -96,9 +99,11 @@ public:
             }
         }
     }
-    virtual MemChunk onAlloc(size_t size, size_t align) {
+    virtual MemChunk onAlloc(size_t size, size_t align) override {
         MNN_ASSERT(size > 0);
-        std::string fileName = MNNFilePathConcat(mFileName, mPrefix + std::to_string(mAllocTimes) + "." + mPosfix);
+        MNN_ASSERT(!mSynced);
+        std::string name = mPrefix + std::to_string(mAllocTimes) + "." + mPosfix;
+        std::string fileName = MNNFilePathConcat(mFileName, name);
         file_t file;
         if (MNNFileExist(fileName.c_str())) {
             file = MNNOpenFile(fileName.c_str(), MNN_FILE_READ | MNN_FILE_WRITE);
@@ -109,13 +114,14 @@ public:
             if (NO_ERROR != code) {
                 MNN_ERROR("Set File size %lu error= %d\n", size, code);
             }
+            mNewMmap = true;
         }
         void* ptr = MNNMmapFile(file, size);
         mCache.insert(std::make_pair(ptr, std::make_tuple(file, size, fileName)));
         mAllocTimes++;
         return MemChunk(ptr, 0);
     }
-    virtual void onRelease(MemChunk chunk) {
+    virtual void onRelease(MemChunk chunk) override {
         MNN_ASSERT(chunk.second == 0);
         auto iter = mCache.find(chunk.first);
         if (iter == mCache.end()) {
@@ -130,6 +136,20 @@ public:
         }
         mCache.erase(iter);
         mAllocTimes = 0;
+    }
+    virtual void sync() override {
+        if (mSynced) {
+            return;
+        }
+        if (!mRemove && mNewMmap) {
+            for (auto& iter : mCache) {
+                MNNMmapSync(iter.first, std::get<1>(iter.second));
+            }
+            std::string cacheName = mPrefix + "sync." + mPosfix;
+            std::string fileName = MNNFilePathConcat(mFileName, cacheName);
+            MNNCreateFile(fileName.c_str());
+            mSynced = true;
+        }
     }
 };
 class RecurseAllocator : public BufferAllocator::Allocator {
@@ -215,6 +235,9 @@ MemChunk EagerBufferAllocator::alloc(size_t size, bool separate, size_t align) {
     node->outside      = mAllocator.get();
     MNN_ASSERT(pointer.second % align == 0);
     if (allocSize > size) {
+        size = UP_DIV(size, mAlign) * mAlign;
+        MNN_ASSERT(allocSize > size);
+
         // Split
         SharedPtr<Node> first(new Node);
         first->parent  = node;
@@ -307,13 +330,15 @@ void EagerBufferAllocator::release(bool allRelease) {
         mTotalSize = 0;
         return;
     }
-    for (auto f : mFreeList) {
-        if (f.second->parent.get() == nullptr) {
-            MNN_ASSERT(mTotalSize >= f.first);
-            mTotalSize -= f.first;
+    for (auto iter = mFreeList.begin(); iter != mFreeList.end(); ) {
+        if (iter->second->parent.get() == nullptr) {
+            MNN_ASSERT(mTotalSize >= iter->first);
+            mTotalSize -= iter->first;
+            iter = mFreeList.erase(iter);
+        } else {
+            iter++;
         }
     }
-    mFreeList.clear();
 }
 
 void EagerBufferAllocator::barrierBegin() {
@@ -338,6 +363,10 @@ void EagerBufferAllocator::beginGroup() {
 
 void EagerBufferAllocator::endGroup() {
     mCurrentFreeList = nullptr;
+}
+
+void EagerBufferAllocator::sync() {
+    mAllocator->sync();
 }
 
 std::pair<void*, size_t> EagerBufferAllocator::getFromFreeList(FREELIST* list, size_t size, bool permiteSplit, size_t align) {

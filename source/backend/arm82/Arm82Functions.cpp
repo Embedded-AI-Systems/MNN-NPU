@@ -25,6 +25,7 @@ using Vec = MNN::Math::Vec<FLOAT16, 8>;
 extern "C" {
 // (UP_DIV(l,8), e, 8) -> (UP_DIV(e,eP), l, eP)
 void Arm82MNNPackForMatMul_A(float* destOrigin, float const** sourceGroup, const int32_t* info, const int32_t* el);
+// void MNNPackTransposeInt16C8(int16_t* dst, const int16_t* src, size_t area, size_t depth, int32_t* areaOffset);
 
 // C(UP_DIV(h,8), e, h8) = B(UP_DIV(h,hP), l, hP) * A(l, eP), hP = 24
 // parameter: [aStride, l, h, cStride, bExtraStride]
@@ -42,14 +43,23 @@ void MNNPackedMatMulFP16_int8(float* C, const float* A, const float* B, const si
 void MNNPackedMatMulRemainFP16_int8(float* C, const float* A, const float* B, size_t eSize, const size_t* parameter, const float* postParameters, const float* bias, const float* k, const float* b);
 #endif
 
+#ifdef __aarch64__
 #ifdef MNN_LOW_MEMORY
-void MNNAbsMaxFP16(const float* source, float* absmax, size_t src_depth_quad, size_t realSize, int pack);
+void MNNAbsMaxFP16_Pack8(const float* source, float* absmax, size_t src_depth_quad, size_t realSize, int pack);
+void MNNAbsMaxFP16_Pack4(const float* source, float* absmax, size_t src_depth_quad, size_t realSize, int pack);
 void MNNQuantScaleFP16(float* sum, float* absmax, float* quant_scale, float* dequant_scale, size_t thread, size_t batch);
-void MNNDynamicQuantFP16(const float* src, int8_t* dst, const float* scale, size_t src_depth_quad, size_t realSize, int pack);
-void MNNQuantSumFP16(float* sum, const float* dequant_scale, size_t thread, size_t batch);
-#endif
-#if defined(__aarch64__)
+void MNNDynamicQuantFP16_Pack8(const float* src, int8_t* dst, const float* scale, size_t src_depth_quad, size_t realSize, const float* bias, size_t pack);
+void MNNDynamicQuantFP16_Pack4(const float* src, int8_t* dst, const float* scale, size_t src_depth_quad, size_t realSize, const float* bias, size_t pack);
+void MNNGeneralIm2col_Arm82(float* destOrigin, float const** sourceGroup, const int32_t* info, const int32_t* el, int32_t LP, int32_t pack);
+void MNNGeneralIm2col_Arm86(float* destOrigin, float const** sourceGroup, const int32_t* info, const int32_t* el, int32_t LP, int32_t pack);
+void MNNLocalMinMaxFP16_Pack4(float* dstMin, float* dstMax, const float* source, size_t blockNum, size_t blockLU, size_t EP, size_t LP, size_t loadDstBuffer);
+void MNNLocalMinMaxFP16_Pack8(float* dstMin, float* dstMax, const float* source, size_t blockNum, size_t blockLU, size_t EP, size_t LP, size_t loadDstBuffer);
+#endif // MNN_LOW_MEMORY
 void CountMinMaxValue_FP16(float* source, float* minVal, float* maxVal, size_t sizeQuad);
+#endif
+
+#if defined(__aarch64__)
+
 void MNNDepthwiseConvFastKernelFP16(float* dst, const float* src, const float* weight, size_t width, size_t src_w_setup,
                                     size_t fw, size_t fh, size_t dilateX_step, size_t dilateY_step, size_t height,
                                     size_t srcHStep, size_t dstHStep, const float* bias, const float* parameters);
@@ -104,6 +114,23 @@ static void ARM82CountMinMaxValue(float* source, float* minVal, float* maxVal, s
         reinterpret_cast<__fp16*>(minVal)[0] = min_;
         reinterpret_cast<__fp16*>(maxVal)[0] = max_;
     }
+}
+#else
+static void ARM82CountMinMaxValue(float* source, float* minVal, float* maxVal, size_t size) {
+    auto srcPtr = (FLOAT16*)source;
+    auto minPtr = (FLOAT16*)minVal;
+    auto maxPtr = (FLOAT16*)maxVal;
+    auto max_ = srcPtr[0], min_ = srcPtr[0];
+    for (int i = 1; i < size; ++i) {
+        if (max_ < srcPtr[i]) {
+            max_ = srcPtr[i];
+        }
+        if (min_ > srcPtr[i]) {
+            min_ = srcPtr[i];
+        }
+    }
+    minPtr[0] = min_;
+    maxPtr[0] = max_;
 }
 #endif
 
@@ -368,13 +395,43 @@ void MNNUnpackTransposeInt16C8(int16_t* dst, const int16_t* src, size_t area, si
     int c      = (int)depth;
     int cDiv4  = c / 8;
     int cAlign = cDiv4 * 8;
+    int areaDiv4 = area / 4;
+    int areaAlign = areaDiv4 * 4;
 
-    for (int hi = 0; hi < area; ++hi) {
-        auto srcHeight = src + hi * 8;
-        auto dstHeight = dst + hi * c;
+    if (areaAlign > 0) {
         for (int ci = 0; ci < cDiv4; ++ci) {
-            vst1q_s16(dstHeight + ci * 8, vld1q_s16(srcHeight + 8 * ci * srcAreaOffset));
+            auto srcH = src + ci * 8 * srcAreaOffset;
+            auto dstH = dst + ci * 8;
+            for (int hi = 0; hi < areaAlign; hi+=4) {
+                auto src0 = srcH + hi * 8;
+                auto src1 = srcH + hi * 8 + 8;
+                auto src2 = srcH + hi * 8 + 16;
+                auto src3 = srcH + hi * 8 + 24;
+                
+                auto dst0 = dstH + hi * c;
+                auto dst1 = dstH + hi * c + c;
+                auto dst2 = dstH + hi * c + 2 * c;
+                auto dst3 = dstH + hi * c + 3 * c;
+                vst1q_s16(dst0, vld1q_s16(src0));
+                vst1q_s16(dst1, vld1q_s16(src1));
+                vst1q_s16(dst2, vld1q_s16(src2));
+                vst1q_s16(dst3, vld1q_s16(src3));
+            }
         }
+    }
+    if (areaAlign < area) {
+        for (int ci = 0; ci < cDiv4; ++ci) {
+            auto srcH = src + 8 * ci * srcAreaOffset;
+            auto dstH = dst + ci * 8;
+            for (int hi = areaAlign; hi < area; ++hi) {
+                auto src0 = srcH + hi * 8;
+                auto dst0 = dstH + hi * c;
+                vst1q_s16(dst0, vld1q_s16(src0));
+            }
+        }
+    }
+    if (c == cAlign) {
+        return;
     }
 
     int cReamin   = c - cAlign;
@@ -400,11 +457,37 @@ void MNNPackTransposeInt16C8(int16_t* dst, const int16_t* src, size_t area, size
     int c      = (int)depth;
     int cDiv4  = c / 8;
     int cAlign = cDiv4 * 8;
-    for (int hi = 0; hi < area; ++hi) {
-        auto srcHeight = (src + hi * c);
-        auto dstHeight = (dst + hi * 8);
+    int areaDiv4 = area / 4;
+    int areaAlign = areaDiv4 * 4;
+    if (areaAlign > 0) {
         for (int ci = 0; ci < cDiv4; ++ci) {
-            vst1q_s16(dstHeight + ci * dstAreaOffset * 8, vld1q_s16(srcHeight + 8 * ci));
+            auto srcH = src + ci * 8;
+            auto dstH = dst + ci * dstAreaOffset * 8;
+            for (int hi = 0; hi < areaAlign; hi+=4) {
+                auto src0 = srcH + hi * c;
+                auto src1 = srcH + hi * c + c;
+                auto src2 = srcH + hi * c + 2 * c;
+                auto src3 = srcH + hi * c + 3 * c;
+                auto dst0 = dstH + hi * 8;
+                auto dst1 = dstH + hi * 8 + 8;
+                auto dst2 = dstH + hi * 8 + 16;
+                auto dst3 = dstH + hi * 8 + 24;
+                vst1q_s16(dst0, vld1q_s16(src0));
+                vst1q_s16(dst1, vld1q_s16(src1));
+                vst1q_s16(dst2, vld1q_s16(src2));
+                vst1q_s16(dst3, vld1q_s16(src3));
+            }
+        }
+    }
+    if (areaAlign < area) {
+        for (int ci = 0; ci < cDiv4; ++ci) {
+            auto srcH = src + ci * 8;
+            auto dstH = dst + ci * dstAreaOffset * 8;
+            for (int hi = areaAlign; hi < area; ++hi) {
+                auto src0 = srcH + hi * c;
+                auto dst0 = dstH + hi * 8;
+                vst1q_s16(dst0, vld1q_s16(src0));
+            }
         }
     }
 
@@ -799,6 +882,234 @@ static void _ArmBasicMNNPackC4ForMatMul_A_L8(int8_t* destOrigin, int8_t const** 
     }
 }
 
+#ifdef MNN_LOW_MEMORY
+void MNNAbsMaxFP16(const float* source, float* absmax, size_t src_depth_quad, size_t realSize, int pack) {
+    if (pack == 4) {
+        MNNAbsMaxFP16_Pack4(source, absmax, src_depth_quad, realSize, pack);
+        return;
+    }
+    if (pack == 8) {
+        MNNAbsMaxFP16_Pack8(source, absmax, src_depth_quad, realSize, pack);
+        return;
+    }
+    // source: (src_depth_quad, realSize, pack)
+    auto srcStep = pack * realSize;
+    auto srcPtr = (FLOAT16*)source;
+    auto dstPtr = (FLOAT16*)absmax;
+    for (int i = 0; i < realSize; ++i) {
+        FLOAT16 absmaxVal = 0; // absmaxVal>=0
+        for (int c = 0; c < src_depth_quad; ++c) {
+            auto src = srcPtr + c * srcStep + i * pack;
+            for (int k = 0; k < pack; ++k) {
+                if (std::abs(src[k]) > absmaxVal) {
+                    absmaxVal = std::abs(src[k]);
+                }
+            }
+        }
+        dstPtr[i] = absmaxVal;
+    }
+    return;
+}
+
+static void MNNDynamicQuantFP16(const float* src, int8_t* dst, const float* scale, size_t src_depth_quad, size_t realSize, int pack, const float* bias = nullptr) {
+    if (pack == 8) {
+        MNNDynamicQuantFP16_Pack8(src, dst, scale, src_depth_quad,realSize, nullptr, pack);
+        return;
+    }
+    if (pack == 4) {
+        MNNDynamicQuantFP16_Pack4(src, dst, scale, src_depth_quad,realSize, nullptr, pack);
+        return;
+    }
+    int8_t* dstPtr = dst;
+    auto srcPtr = (FLOAT16*)src;
+
+    for (int i = 0; i < realSize; ++i) {
+        auto scaleVal = static_cast<FLOAT16>(scale[i]);
+        for (int c = 0; c < src_depth_quad; ++c) {
+            auto srcZ = srcPtr + c * pack * realSize + i * pack;
+            auto dstZ = dstPtr + c * pack * realSize + i * pack;
+            for (int k = 0; k < pack; ++k) {
+                int val = (int)roundf(srcZ[k] * scaleVal);
+                dstZ[k] = val;
+            }
+        }
+    }
+    return;
+}
+
+static void MNNAsyQuantFunc_Arm82(int8_t* dst, const float* src, float* qscale, float* qbias, const size_t* info) {
+    // input shape: [kernelsize, blockNum, blockLU, EP, LP]
+    // qscale&qbias [blockNum, EP]
+    auto blockNum = info[0];
+    auto EP = info[1];        // real area for data
+    auto LP = info[2];        // Innermost data layout, may come from backend's pack or gemmint8 units' SRC_UNIT
+    auto DST_XUNIT = info[3]; // backend gemmint8 units
+    auto SRC_UNIT = info[4];
+    auto kernelsize = info[5];
+    auto blockLU = info[6];
+    auto stride0 = blockNum * blockLU * EP * LP;
+    auto stride1 = blockLU * EP * LP;
+    auto srcPtr = (FLOAT16*)src;
+#ifdef __aarch64__
+    if (LP == 4 || LP == 8) {
+        for (int k = 0; k < kernelsize; ++k) {
+            for (int i = 0; i < blockNum; ++i) {
+                if (LP == 4) {
+                    MNNDynamicQuantFP16_Pack4((float*)(srcPtr + k * stride0 + i * stride1), dst + k * stride0 + i * stride1, qscale + i * EP, blockLU, EP, qbias + i * EP, LP);
+                }
+                if (LP == 8) {
+                    MNNDynamicQuantFP16_Pack8((float*)(srcPtr + k * stride0 + i * stride1), dst + k * stride0 + i * stride1, qscale + i * EP, blockLU, EP, qbias + i * EP, LP);
+                }
+            }
+        }
+        return;
+    }
+#endif
+    for (int i = 0; i < EP; ++i) {
+        for (int bk = 0; bk < blockNum; ++bk) {
+            float quant_scale = qscale[i + bk * EP];
+            float quant_bias  = qbias[i + bk * EP];
+            for (int n = 0; n < kernelsize; ++n) {
+                for (int k = 0; k < blockLU; ++k) {
+                    for (int j = 0; j < LP; ++j) {
+                        int dataIndx = n * stride0 + bk * stride1 + k * EP * LP + i * LP + j;
+                        auto data_ = static_cast<float>(srcPtr[dataIndx]);
+                        int qval = static_cast<int32_t>(roundf(data_ * quant_scale + quant_bias));
+                        dst[dataIndx] = qval;
+                    }
+                }
+            }
+        }
+    }
+}
+
+static void MNNAsyQuantInfo_FP16(float* scale, float* bias, float* qscale, float* qbias, float* dstMin, float* dstMax, float* src, const size_t* info) {
+    auto blockNum = info[0];
+    auto plane = info[1];        // real area for data
+    auto innerSide = info[2];    // Innermost data layout, may come from backend's pack or gemmint8 units' SRC_UNIT
+    auto DST_XUNIT = info[3];
+    auto kernelsize = info[5];
+    auto blockLU = info[6];
+    auto stride0 = blockNum * blockLU * plane * innerSide;
+    auto stride1 = blockLU * plane * innerSide;
+    auto srcPtr = (FLOAT16*)src;
+
+    // input shape: [kernelsize,blocknum,blocklu,DST_XUNIT,SRC_UNIT] or [ic/core->pack, plane, core->pack]
+    // dequant scale/bias : [EU, blockNum, step]
+    // quant scale/bias: [blockNum, plane]
+    if (info[7] == 1) { // scale&bias:[1]
+        ARM82CountMinMaxValue(src, dstMin, dstMax, kernelsize * stride0);
+        float maxval = *(FLOAT16*)dstMax;
+        float minval = *(FLOAT16*)dstMin;
+        if (info[8] == 1 && (maxval - minval) > 1e-7) {
+            if (minval > 0.f) {
+                minval = 0.f;
+            } else if (maxval < 0.f){
+                maxval = 0.f;
+            }
+        }
+        auto range = maxval - minval;
+        if (range <= 1e-7) {
+            scale[0] = 0.f;
+            qscale[0] = 0.f;
+            qbias[0] = 0.f;
+            bias[0] = maxval;
+        } else {
+            qscale[0] = 255.f / range;
+            scale[0] = range / 255.f;
+            qbias[0] = roundf(-minval * 255.f / range)- 128.f;
+            bias[0] = -qbias[0] * scale[0];
+        }
+        return;
+    }
+
+#ifdef __aarch64__
+    if (DST_XUNIT == 12) { // Arm82, fp16: core->pack=8, SRC_UNIT=4
+        // max,min shape: [blockNum, EP]
+        if (innerSide == 4) {
+            for (int i = 0; i < kernelsize; ++i) {
+                MNNLocalMinMaxFP16_Pack4(dstMin, dstMax, (float*)(srcPtr + i * stride0), blockNum, blockLU, plane, innerSide, i);
+            }
+        }
+        if (innerSide == 8) {
+            for (int i = 0; i < kernelsize; ++i) {
+                MNNLocalMinMaxFP16_Pack8(dstMin, dstMax, (float*)(srcPtr + i * stride0), blockNum, blockLU, plane, innerSide, i);
+            }
+        }
+        // scale, bias
+        auto success = MNNAsyLocalQuantInfo_EP12_FP16(scale, bias, qscale, qbias, dstMin, dstMax, info);
+        if (!success) {
+            MNN_ERROR("Call error: MNNAsyLocalQuantInfo_EP12_FP16\n");
+            return;
+        }
+        return;
+    }
+    if (DST_XUNIT == 10 && innerSide == 8) { // Arm86, fp16: core->pack=8, SRC_UNIT=8
+        // max,min shape: [blockNum, plane]
+        for (int i = 0; i < kernelsize; ++i) {
+            MNNLocalMinMaxFP16_Pack8(dstMin, dstMax, (float*)(srcPtr + i * stride0), blockNum, blockLU, plane, innerSide, i);
+        }
+        // scale, bias
+        auto success = MNNAsyLocalQuantInfo_EP10_FP16(scale, bias, qscale, qbias, dstMin, dstMax, info);
+        if (!success) {
+            MNN_ERROR("Call error: MNNAsyLocalQuantInfo_EP10_FP16\n");
+            return;
+        }
+        return;
+    }
+#else
+    // aarch32
+    // max,min shape: [blockNum, plane]
+    auto minPtr = (FLOAT16*)dstMin;
+    auto maxPtr = (FLOAT16*)dstMax;
+    for (int i = 0; i < plane; ++i) {
+        for (int bk = 0; bk < blockNum; ++bk) {
+            auto idx0 = i * innerSide + bk * stride1;
+            auto max_ = srcPtr[idx0];
+            auto min_ = max_;
+            for (int n = 0; n < kernelsize; ++n) {
+                for (int k = 0; k < blockLU; ++k) {
+                    for (int j = 0; j < innerSide; ++j) {
+                        auto dataIndx = idx0 + n * stride0 + k * (plane * innerSide) + j;
+                        auto data_ = srcPtr[dataIndx];
+                        max_ = ALIMAX(max_, data_);
+                        min_ = ALIMIN(min_, data_);
+                    }
+                }
+            }
+            auto sindx = i + bk * plane;
+            minPtr[sindx] = min_;
+            maxPtr[sindx] = max_;
+        }
+    }
+    // scale, bias
+    for (int i = 0; i < plane; ++i) {
+        auto step = ALIMIN(DST_XUNIT, plane - (i / DST_XUNIT) * DST_XUNIT);
+        auto sind0 = (i / DST_XUNIT) * DST_XUNIT * blockNum + (i % DST_XUNIT);
+        for (int k = 0; k < blockNum; ++k) {
+            auto sind = sind0 + k * step;
+            auto qind = i + k * plane;
+            auto max_ = (float)maxPtr[qind];
+            auto min_ = (float)minPtr[qind];
+            auto range = max_ - min_;
+            if (fabs(range) < 1e-7) {
+                qscale[qind] = 0.f;
+                qbias[qind] = 0.f;
+                scale[sind] = 0.f;
+                bias[sind] = max_;
+            } else {
+                qscale[qind] = 255.f / range;
+                qbias[qind] = -min_ * 255.f / range - 128.0f;
+                scale[sind] = range / 255.f;
+                bias[sind] = min_ + (128.f / 255.f) * range;
+
+            }
+        }
+    }
+#endif
+}
+#endif // MNN_LOW_MEMORY
+
 static CoreFunctions* gInstance = nullptr;
 static CoreInt8Functions* gArm82CoreInt8Functions = nullptr;
 
@@ -838,9 +1149,8 @@ bool Arm82Functions::init() {
     FUNC_PTR_ASSIGN(gInstance->MNNMatrixSub, MNNMatrixSubFP16);
     FUNC_PTR_ASSIGN(gInstance->MNNMatrixAdd, MNNMatrixAddFP16);
     FUNC_PTR_ASSIGN(gInstance->MNNStrassenMergeCFunction, ARM82StrassenMerge);
-#ifdef MNN_LOW_MEMORY
-    FUNC_PTR_ASSIGN(gInstance->MNNDynamicUpdateConvBiasScale, origin->MNNDynamicUpdateConvBiasScale);
-#endif
+    gInstance->MNNReorderWeightInt4 = origin->MNNReorderWeightInt4;
+    gInstance->MNNSumWeightInt8 = origin->MNNSumWeightInt8;
     gInstance->penalty = 2.0f;
     FUNC_PTR_ASSIGN(gInstance->MNNScaleAndAddBias, MNNScaleAndAddBiasFP16);
     FUNC_PTR_ASSIGN(gInstance->MNNGridSampleComputeCord, MNNGridSampleComputeCordFP16);
@@ -863,8 +1173,6 @@ bool Arm82Functions::init() {
     gInstance->supportI8mm = origin->supportI8mm;
 #ifdef MNN_CPU_WEIGHT_DEQUANT_GEMM
     // Weight Dequant Gemm Kernels
-    FUNC_PTR_ASSIGN(gInstance->MNNPackedMatMul_int4, MNNPackedMatMulFP16_int4);
-    FUNC_PTR_ASSIGN(gInstance->MNNPackedMatMulRemain_int4, MNNPackedMatMulRemainFP16_int4);
     FUNC_PTR_ASSIGN(gInstance->MNNPackedMatMul_int8, MNNPackedMatMulFP16_int8);
     FUNC_PTR_ASSIGN(gInstance->MNNPackedMatMulRemain_int8, MNNPackedMatMulRemainFP16_int8);
 #endif
@@ -873,9 +1181,19 @@ bool Arm82Functions::init() {
     FUNC_PTR_ASSIGN(gInstance->MNNAbsMax, MNNAbsMaxFP16);
     FUNC_PTR_ASSIGN(gInstance->MNNQuantScale, MNNQuantScaleFP16);
     FUNC_PTR_ASSIGN(gInstance->MNNDynamicQuant, MNNDynamicQuantFP16);
-    FUNC_PTR_ASSIGN(gInstance->MNNQuantSum, MNNQuantSumFP16);
-    FUNC_PTR_ASSIGN(gInstance->MNNCountMaxMinValue, ARM82CountMinMaxValue);
+    FUNC_PTR_ASSIGN(gInstance->MNNAsyQuantFunc, MNNAsyQuantFunc_Arm82);
+    FUNC_PTR_ASSIGN(gInstance->MNNAsyQuantInfo, MNNAsyQuantInfo_FP16); // return 'plane' min&max
+    FUNC_PTR_ASSIGN(gInstance->MNNDynamicUpdateConvBiasScale, origin->MNNDynamicUpdateConvBiasScale);
+    #ifdef __aarch64__
+    if (origin->supportSDot) {
+        FUNC_PTR_ASSIGN(gInstance->MNNGeneralIm2Col, MNNGeneralIm2col_Arm82);
+    }
+    if (origin->supportI8mm) {
+        FUNC_PTR_ASSIGN(gInstance->MNNGeneralIm2Col, MNNGeneralIm2col_Arm86);
+    }
+    #endif
 #endif
+    FUNC_PTR_ASSIGN(gInstance->MNNCountMaxMinValue, ARM82CountMinMaxValue); // return one min&max
     FUNC_PTR_ASSIGN(gInstance->MNNSumByAxisLForMatmul_A, origin->MNNSumByAxisLForMatmul_A);
     FUNC_PTR_ASSIGN(gInstance->MNNDepthwiseConvFastKernel, MNNDepthwiseConvFastKernelFP16);
 #endif

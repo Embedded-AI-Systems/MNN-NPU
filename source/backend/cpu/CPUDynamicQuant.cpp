@@ -16,7 +16,7 @@
 #include "core/OpCommonUtils.hpp"
 #include "MNN_generated.h"
 namespace MNN {
-
+#ifndef MNN_REDUCE_SIZE
 
 CPUDynamicQuant::CPUDynamicQuant(const MNN::Op* op, Backend* backend) : Execution(backend) {
     
@@ -42,7 +42,7 @@ ErrorCode CPUDynamicQuant::onExecute(const std::vector<Tensor*> &inputs,
     MNN_ASSERT(range != 0);
     quantScale = 255.0f / range;
     dequantScale = range / 255.0f;
-    zeroPoint = std::min(255.f, std::max(roundf(-(minVal * 255.f) / range), 0.f)) - 128.0f;
+    zeroPoint = roundf(-(minVal * 255.f) / range) - 128.0f;
     int pack = core->pack;
     std::vector<float> qsVec(pack, quantScale);
     int sizeDiv = UP_DIV(size, pack);
@@ -60,11 +60,15 @@ ErrorCode CPUDynamicQuant::onExecute(const std::vector<Tensor*> &inputs,
 CPUDynamicQuant::~CPUDynamicQuant() {
 
 }
-
+#endif
 class CPUDynamicQuantCreator : public CPUBackend::Creator {
 public:
     Execution* onCreate(const std::vector<Tensor*>& inputs, const std::vector<Tensor*>& outputs, const MNN::Op* op, Backend* backend) const override {
+#ifndef MNN_REDUCE_SIZE
         return new CPUDynamicQuant(op, backend);
+#else
+        return nullptr;
+#endif
     }
 };
 

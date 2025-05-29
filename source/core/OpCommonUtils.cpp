@@ -10,9 +10,26 @@
 #include "core/Execution.hpp"
 #include "MNN_generated.h"
 #include "Macro.h"
-#include <random>
 
 namespace MNN {
+bool OpCommonUtils::checkNet(const void* buffer, size_t length) {
+    // For mnn build mini, skip check buffer, it will reduce 100k size
+#ifndef MNN_SKIPBUILD_GEOMETRY
+    flatbuffers::Verifier verify((const uint8_t*)buffer, length);
+    if (false == VerifyNetBuffer(verify)) {
+        MNN_PRINT("Invalidate buffer to create MNN Module\n");
+        return false;
+    }
+    // Check Auto Inputs and Outputs
+    auto net = GetNet(buffer);
+    if (nullptr == net->oplists() || nullptr == net->tensorName()) {
+        MNN_ERROR("Invalid net, for null oplist or tensorName\n");
+        return false;
+    }
+#endif
+    return true;
+}
+
 Tensor::DimensionType OpCommonUtils::convertDimType(MNN_DATA_FORMAT dimensionFormat) {
     auto dimType = Tensor::CAFFE;
     switch (dimensionFormat) {
@@ -669,14 +686,18 @@ static bool _RebuildExternalOp(FileLoader* external, const MNN::Op* origin, flat
 		            }
 		        }
                 if (param->quanParameter->index.empty() && param->external.size() > 4) {
-                    param->quanParameter->index.resize(param->external[4]/sizeof(uint32_t));
-                    external->read((char*)param->quanParameter->index.data(), param->external[4]);
+                    if (param->external[4] > 0) {
+                        param->quanParameter->index.resize(param->external[4]/sizeof(uint32_t));
+                        external->read((char*)param->quanParameter->index.data(), param->external[4]);
+                    }
                 }
             } else {
-                external->offset(param->external[0]);
-                param->weight.resize(param->external[1] / sizeof(float));
-                external->read((char*)param->weight.data(), param->external[1]);
+                // Create quanParameter, will load external weight in ConvolutionCommon::load
+                param->quanParameter.reset(new IDSTQuanT);
+                param->quanParameter->type = 8;
+                op->externalPath = external->path();
                 param->bias.resize(param->external[2] / sizeof(float));
+                external->offset(param->external[0] + param->external[1]);
                 external->read((char*)param->bias.data(), param->external[2]);
             }
             break;
@@ -692,7 +713,7 @@ static bool _RebuildExternalOp(FileLoader* external, const MNN::Op* origin, flat
 }
 Execution* OpCommonUtils::createExecutionWithExternal(Backend* backend, const std::vector<Tensor*>& inputs, const std::vector<Tensor*>& outputs,
                                               const MNN::Op* op, FileLoader* externalFile, std::shared_ptr<BufferStorage>& tmpstore) {
-#ifdef MNN_BUILD_MINI
+#ifdef MNN_SKIPBUILD_GEOMETRY
     return backend->onCreate(inputs, outputs, op);
 #else
     bool hasExternal = false;
@@ -713,17 +734,27 @@ Execution* OpCommonUtils::createExecutionWithExternal(Backend* backend, const st
         return backend->onCreate(inputs, outputs, op);
     }
     flatbuffers::FlatBufferBuilder builder;
-    bool res = _RebuildExternalOp(externalFile, op, builder);
-    if (!res) {
-        MNN_ERROR("Rebuild External Op failed\n");
-        return nullptr;
+    bool usemmap = false;
+    if (backend && backend->getRuntime()) {
+        usemmap = (backend->getRuntime()->hint().useCachedMmap > 1);
     }
-    auto newOp = flatbuffers::GetRoot<MNN::Op>(builder.GetBufferPointer());
-    auto execution  = backend->onCreate(inputs, outputs, newOp);
+    Execution* execution;
+    if ((!usemmap)) {
+        bool res = _RebuildExternalOp(externalFile, op, builder);
+        if (!res) {
+            MNN_ERROR("Rebuild External Op failed\n");
+            return nullptr;
+        }
+        auto newOp = flatbuffers::GetRoot<MNN::Op>(builder.GetBufferPointer());
+        execution  = backend->onCreate(inputs, outputs, newOp);
+    } else {
+        execution  = backend->onCreate(inputs, outputs, op);
+    }
     if (nullptr == execution) {
         return execution;
     }
     if (op->main_type() == OpParameter_Convolution2D) {
+        // For convolution / deconvolution, execution will need op info after created, try clone it and remove newOp
         Execution* copyExe = nullptr;
         execution->onClone(backend, op, &copyExe);
         if (nullptr != copyExe) {

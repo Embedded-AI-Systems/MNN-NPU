@@ -18,8 +18,9 @@
 #include "core/TensorUtils.hpp"
 
 namespace MNN {
+#ifndef MNN_REDUCE_SIZE
 Convolution1x1Strassen::Convolution1x1Strassen(const Convolution2DCommon *common, Backend *b, const float *originWeight,
-                                               size_t originWeightSize, const float *bias, size_t biasSize, std::shared_ptr<ConvolutionCommon::Int8Common> quantInfo)
+                                               size_t originWeightSize, const float *bias, size_t biasSize)
     : CPUConvolution(common, b) {
     auto outputCount = (int)biasSize;
     int ePack, lPack, hPack;
@@ -33,25 +34,6 @@ Convolution1x1Strassen::Convolution1x1Strassen(const Convolution2DCommon *common
         mValid = false;
         return;
     }
-#ifdef MNN_LOW_MEMORY
-    if ((originWeightSize == 0 || nullptr == originWeight) && nullptr != quantInfo.get()) { // Use Int8 Weight.
-        originWeightSize = quantInfo->weight.size();
-        int lSize = (int)originWeightSize / (int)biasSize * common->kernelX() * common->kernelY();
-        auto hU = UP_DIV(outputCount, hPack);
-        auto lU = UP_DIV(lSize, lPack);
-        mSrcCount   = (int)originWeightSize / outputCount;
-
-        mResource->mWeight.reset(Tensor::createDevice<int8_t>(std::vector<int>{UP_DIV(outputCount, hPack), UP_DIV(mSrcCount, lPack) * lPack, hPack}));
-        mValid = b->onAcquireBuffer(mResource->mWeight.get(), Backend::STATIC);
-        if (!mValid) {
-            MNN_ERROR("Not Enough Memory\n");
-            return;
-        }
-
-        DenseConvolutionTiledExecutor::initQuantizeResource(quantInfo, mResource, hU, hPack, lU, lPack, outputCount, (int)originWeightSize / (int)biasSize, common->kernelX() * common->kernelY(), core->bytes);
-        return;
-    }
-#endif
     // Use Float Weight.
     mResource->mWeight.reset(Tensor::createDevice<float>(std::vector<int>{UP_DIV(outputCount, hPack), UP_DIV(mSrcCount, lPack) * lPack, hPack}));
     mValid = b->onAcquireBuffer(mResource->mWeight.get(), Backend::STATIC);
@@ -70,10 +52,88 @@ Convolution1x1Strassen::Convolution1x1Strassen(const Convolution2DCommon *common
             return;
         }
         core->MNNFp32ToLowp(originWeight, tempTensor->host<int16_t>(), outputCount * mSrcCount);
+#ifdef MNN_KLEIDIAI_ENABLED
+        if (core->bytes == 2) {
+            if (!KleidiAI::mKaiInitialized) {
+                KleidiAI& kai = KleidiAI::getInstance(*MNNGetCPUInfo(), true, false);
+            }
+            KleidiAI::AccelType accelType = KleidiAI::AccelType::FP16;
+            KleidiAI& kai = KleidiAI::getInstance();
+            if (!kai.isLoaded(accelType)) {
+                kai.setLoaded(accelType);
+                kai.printInfo(accelType);
+            }
+
+            if (kai.canAccelerate(accelType)) {
+                mAccelType = accelType;
+                AutoRelease<Tensor> tempBiasTensor(Tensor::createDevice<float>({outputCount}));
+                mValid = b->onAcquireBuffer(tempBiasTensor.get(), Backend::STATIC);
+                if (!mValid) {
+                    b->onReleaseBuffer(tempTensor.get(), Backend::STATIC);
+                    MNN_ERROR("Not Enough Memory\n");
+                    return;
+                }
+                core->MNNFp32ToLowp(bias, tempBiasTensor->host<int16_t>(), outputCount);
+
+                int packedSize = kai.getRhsPackedSize(mAccelType, outputCount, mSrcCount, 0);
+                //Alloc packed weight tensor.
+                mResource->mWeight.reset(Tensor::createDevice<float>({packedSize}));
+                bool success = b->onAcquireBuffer(mResource->mWeight.get(), Backend::STATIC);
+                if (!success) {
+                    b->onReleaseBuffer(tempBiasTensor.get(), Backend::STATIC);
+                    b->onReleaseBuffer(tempTensor.get(), Backend::STATIC);
+                    MNN_ERROR("Out of static memory!\n");
+                    return;
+                }
+
+                //Run rhs pack.
+                kai.runRhsPack(mAccelType, 1, outputCount, mSrcCount, 0, mSrcCount * sizeof(__fp16),
+                               tempTensor->host<void>(), nullptr, nullptr, tempBiasTensor->host<void>(),
+                               mResource->mWeight->host<void>());
+                b->onReleaseBuffer(tempBiasTensor.get(), Backend::STATIC);
+            } else {
+                core->MNNPackForMatMul_B(mResource->mWeight->host<float>(), tempTensor->host<float>(), outputCount, mSrcCount, true);
+            }
+        } else {
+            core->MNNPackForMatMul_B(mResource->mWeight->host<float>(), tempTensor->host<float>(), outputCount, mSrcCount, true);
+        }
+#else
         core->MNNPackForMatMul_B(mResource->mWeight->host<float>(), tempTensor->host<float>(), outputCount, mSrcCount, true);
+#endif
         b->onReleaseBuffer(tempTensor.get(), Backend::STATIC);
     } else {
+#ifdef MNN_KLEIDIAI_ENABLED
+        if (!KleidiAI::mKaiInitialized) {
+            KleidiAI& kai = KleidiAI::getInstance(*MNNGetCPUInfo(), false, false);
+        }
+
+        KleidiAI::AccelType accelType = KleidiAI::AccelType::FP32;
+        KleidiAI& kai = KleidiAI::getInstance();
+        if(!kai.isLoaded(accelType)) {
+            kai.setLoaded(accelType);
+            kai.printInfo(accelType);
+        }
+
+        if (kai.canAccelerate(accelType)) {
+            mAccelType = accelType;
+            int packedSize = kai.getRhsPackedSize(mAccelType, outputCount, mSrcCount, 0);
+            //Alloc packed weight tensor.
+            mResource->mWeight.reset(Tensor::createDevice<float>({packedSize}));
+            bool success = b->onAcquireBuffer(mResource->mWeight.get(), Backend::STATIC);
+            if (!success) {
+                MNN_ERROR("Out of static memory!\n");
+                return;
+            }
+
+            //Run rhs pack.
+            kai.runRhsPack(mAccelType, 1, outputCount, mSrcCount, 0, mSrcCount * sizeof(float),
+                        originWeight, nullptr, nullptr, bias, mResource->mWeight->host<void>());
+        } else {
+            core->MNNPackForMatMul_B(mResource->mWeight->host<float>(), originWeight, outputCount, mSrcCount, true);
+        }
+#else
         core->MNNPackForMatMul_B(mResource->mWeight->host<float>(), originWeight, outputCount, mSrcCount, true);
+#endif
     }
 }
 Convolution1x1Strassen::Convolution1x1Strassen(std::shared_ptr<CPUConvolution::Resource> resource, const Convolution2DCommon *common, Backend* b) : CPUConvolution(common, b) {
@@ -91,7 +151,11 @@ bool Convolution1x1Strassen::onClone(Backend* bn, const Op* op, Execution** dst)
     if (nullptr == dst) {
         return true;
     }
-    *dst = new Convolution1x1Strassen(mResource, op->main_as_Convolution2D()->common(), bn);
+    auto exe = new Convolution1x1Strassen(mResource, op->main_as_Convolution2D()->common(), bn);
+#ifdef MNN_KLEIDIAI_ENABLED
+    exe->mAccelType = this->mAccelType;
+#endif
+    *dst = exe;
     return true;
 }
 
@@ -107,17 +171,11 @@ ErrorCode Convolution1x1Strassen::onResize(const std::vector<Tensor *> &inputs, 
     const int numberThread = ((CPUBackend *)backend())->threadNumber();
     auto ic = input->channel();
     auto oc = output->channel();
-    auto icC4        = UP_DIV(ic, core->pack);
     auto ocC4        = UP_DIV(oc, core->pack);
     auto batch       = input->batch();
     auto matrixSizeE = output->height() * output->width() * input->batch();
-    auto outputPlane = output->height() * output->width();
     mUnits.clear();
     std::shared_ptr<char> __autoFunction;
-    auto padY     = mPadY;
-    auto padX     = mPadX;
-    auto strideX  = mCommon->strideX();
-    auto strideY  = mCommon->strideY();
     auto postParameters = getPostParameters();
     auto memoryPool = ((CPUBackend *)backend())->getBufferAllocator();
     memoryPool->barrierBegin();
@@ -125,17 +183,27 @@ ErrorCode Convolution1x1Strassen::onResize(const std::vector<Tensor *> &inputs, 
     int maxDepth = 5;
     auto icAlign = UP_DIV(ic, lPack) * lPack;
     auto weightTensor = mResource->mWeight.get();
-    uint8_t* dequantAlpha = nullptr;
-    uint8_t* dequantBias = nullptr;
-    int dequantBits = bytes * 8; // fp16:16, fp32:32
-#ifdef MNN_LOW_MEMORY
-    if (mResource && mResource->mDequantize.bits <= 8) {
-        dequantAlpha = mResource->mDequantize.mScaleBias->host<uint8_t>();
-        dequantBias = dequantAlpha + mResource->hU * mResource->hP * bytes;
-        dequantBits = mResource->mDequantize.bits;
+
+#ifdef MNN_KLEIDIAI_ENABLED
+    KleidiAI& kai = KleidiAI::getInstance();
+    if (kai.canAccelerate(mAccelType)) {
+        if (batch != 1) {
+            int packedSize = kai.getLhsPackedSize(mAccelType, batch, ic);
+
+            mInputResource.reset(Tensor::createDevice<float>({packedSize}));
+            bool success = backend()->onAcquireBuffer(mInputResource.get(), Backend::DYNAMIC);
+            if (!success) {
+                MNN_ERROR("Out of dynamic memory!\n");
+                return OUT_OF_MEMORY;
+            }
+
+            backend()->onReleaseBuffer(mInputResource.get(), Backend::DYNAMIC);
+        }
+        return NO_ERROR;
     }
 #endif
-    mWeightBytes = static_cast<float>(dequantBits) / 8.0f;
+
+    mWeightBytes = bytes;
     if (matrixSizeE > CONVOLUTION_TILED_NUMBER * 8 * numberThread && matrixSizeE > ocC4) {
         std::vector<int> divides(numberThread+1);
         divides[0] = 0;
@@ -154,7 +222,7 @@ ErrorCode Convolution1x1Strassen::onResize(const std::vector<Tensor *> &inputs, 
             unit.offset[2] = 0;
             unit.offset[0] = core->pack * planeStart * bytes;
             unit.offset[3] = core->pack * planeStart * bytes;
-            unit.mStracssenComputor.reset(new StrassenMatrixComputor(backend(), false, maxDepth, dequantAlpha, dequantBias, dequantBits));
+            unit.mStracssenComputor.reset(new StrassenMatrixComputor(backend(), false, maxDepth));
             int e = planeSize;
             int l = ic;
             int h = oc;
@@ -200,7 +268,7 @@ ErrorCode Convolution1x1Strassen::onResize(const std::vector<Tensor *> &inputs, 
             unit.offset[0] = 0;
             unit.offset[3] = core->pack * matrixSizeE * ocStart * bytes;
 
-            unit.mStracssenComputor.reset(new StrassenMatrixComputor(backend(), false, maxDepth, dequantAlpha, dequantBias, dequantBits));
+            unit.mStracssenComputor.reset(new StrassenMatrixComputor(backend(), false, maxDepth));
             int e = matrixSizeE;
             int l = ic;
             int h = std::min(ocSize * core->pack, ocWeightSize * hPack);
@@ -230,6 +298,24 @@ ErrorCode Convolution1x1Strassen::onExecute(const std::vector<Tensor *> &inputs,
     auto weightPtr = mResource->mWeight->host<uint8_t>();
     auto biasPtr = mResource->mBias->host<uint8_t>();
 
+#ifdef MNN_KLEIDIAI_ENABLED
+    KleidiAI& kai = KleidiAI::getInstance();
+    if (kai.canAccelerate(mAccelType)) {
+        const size_t m = input->batch(); //lhs vector number.
+        const size_t n = output->channel(); //rhs vector number.
+        const size_t k = input->channel(); //vector size.
+        auto lhsPacked = inputPtr;
+        auto dst = output->host<uint8_t>();
+        size_t elementSize = kai.isFP16() ? sizeof(__fp16) : sizeof(float);
+        if(m != 1) {
+            lhsPacked = mInputResource->host<uint8_t>();
+            kai.runLhsPack(mAccelType, m, k, 0, inputPtr, k * elementSize, lhsPacked);
+        }
+        auto postPtr = getPostParameters();
+        kai.runMatmul(mAccelType, m, n, k, 0, lhsPacked, weightPtr, dst, n * elementSize, elementSize, postPtr[3], postPtr[2]);
+        return NO_ERROR;
+    }
+#endif
     MNN_CONCURRENCY_BEGIN(tId, size) {
         auto &unit = mUnits[tId];
         if (unit.mValid) {
@@ -239,4 +325,5 @@ ErrorCode Convolution1x1Strassen::onExecute(const std::vector<Tensor *> &inputs,
     MNN_CONCURRENCY_END();
     return NO_ERROR;
 }
+#endif
 } // namespace MNN

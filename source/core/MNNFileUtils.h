@@ -23,7 +23,7 @@
 #else
 #include <unistd.h>
 #include <sys/stat.h>
-#include <sys/fcntl.h>
+#include <fcntl.h>
 #include <sys/mman.h>
 #endif
 
@@ -186,5 +186,16 @@ MNN_PUBLIC void * MNNMmapFile(file_t file, size_t size);
 **              and the size is correct
 */
 MNN_PUBLIC ErrorCode MNNUnmapFile(void * addr, size_t size);
+
+/*=============================================================================================
+**  @brief      Sync mmap memory to disk.
+**  @param      addr -- start address of the mapped space
+**              size -- mapped length
+**  @return     If succeeded, returns NO_ERROR
+**              If failed, returns FAILED
+**  @warning    Make sure that this space was mapped by the MNNMmapFile() before
+**              and the size is correct
+*/
+MNN_PUBLIC ErrorCode MNNMmapSync(void * addr, size_t size);
 
 #endif // MNN_FileUtils_H
